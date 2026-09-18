@@ -389,12 +389,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
     }
 
-    private onData(
-        session: Session,
-        sender: RelayRole,
-        header: Frame extends { type: 'DATA'; header: infer H } ? H : never,
-        payload: Buffer,
-    ): void {
+    private onData(session: Session, sender: RelayRole, header: DataHeader, payload: Buffer): void {
         if (session.status !== 'active') return
         const direction = directionFor(sender)
         const conn = session.sockets[sender]!
