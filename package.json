@@ -48,6 +48,7 @@
     "dependencies": {
         "jsonwebtoken": "^9.0.3",
         "noise-handshake": "^4.2.0",
+        "sodium-native": "^5.1.0",
         "uuid": "^13.0.0",
         "ws": "^8.21.3",
         "zod": "^4.6.5"
