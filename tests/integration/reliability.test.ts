@@ -276,7 +276,7 @@ describe('two tunnels through the fake relay', () => {
             ).toBe(true)
             expect(await nacked).toBe(messageId)
             expect(events.find((e) => e.type === 'nack')).toMatchObject({ messageId, reason: 'direction' })
-            expect(pair.destination.tunnel.exchange!.stats()).toEqual({
+            expect(pair.destination.tunnel.exchange!.stats()).toMatchObject({
                 pendingAcks: 0,
                 queuedQueries: 0,
                 inFlight: false,

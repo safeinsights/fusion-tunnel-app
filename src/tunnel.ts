@@ -3,6 +3,7 @@ import type { ServerConfig } from '@/config'
 import { createHttpServer } from '@/http/server'
 import type { Router } from '@/http/router'
 import { canonicalJson } from '@/lib/canonical'
+import { BmaClient } from '@/lib/bma/client'
 import { Channel, type ChannelDeps, type VerifiedPeer } from '@/lib/channel'
 import { createIdentity, type Identity } from '@/lib/identity'
 import { Exchange, nullTransport, type ExchangeTransport } from '@/lib/exchange'
@@ -31,6 +32,8 @@ export type TunnelDeps = {
     transport?: ExchangeTransport
     now?: () => Date
     channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider'>
+    /** `null` disables the BMA client (harnesses that play the directory themselves). */
+    bma?: null | { fetch?: typeof fetch }
 }
 
 /**
@@ -51,6 +54,7 @@ export type Tunnel = {
     readonly exchange: Exchange | undefined
     readonly channel: Channel | undefined
     readonly caps: CapsMeter | undefined
+    readonly bma: BmaClient | undefined
     configure(bundle: ConfigurationBundle): ConfigureResult
     setTransport(transport: ExchangeTransport): void
     /** The peer's key passed verification: attach to the relay (first time) or re-handshake. */
@@ -83,6 +87,7 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
     let exchange: Exchange | undefined
     let channel: Channel | undefined
     let caps: CapsMeter | undefined
+    let bma: BmaClient | undefined
 
     lifecycle.onTransition((transition) => {
         log.info('lifecycle.transition', {
@@ -122,6 +127,9 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
         get caps() {
             return caps
         },
+        get bma() {
+            return bma
+        },
         // Assigned below once the HTTP server exists.
         router: undefined as unknown as Router,
         server: undefined as unknown as http.Server,
@@ -141,6 +149,8 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
                 lifecycle,
                 caps,
                 now: () => now().getTime(),
+                // The relay client dials with whatever token the BMA client has most recently pre-fetched.
+                tokenProvider: () => bma?.currentRelayToken() ?? next.relay.token,
                 ...deps.channelDeps,
             })
             channel.on('control', (control, messageId, reason) => {
@@ -151,6 +161,21 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             exchange.setTransport(deps.transport ?? channel.delivery)
             transport = deps.transport ?? channel.delivery
             lifecycle.transition('CONFIGURED', 'configuration bundle accepted')
+            if (deps.bma !== null) {
+                bma = new BmaClient({
+                    bundle: next,
+                    identity,
+                    lifecycle,
+                    channel,
+                    exchange,
+                    tuning: config.tuning,
+                    caps,
+                    verifiedPeer: (peer) => tunnel.verifiedPeer(peer),
+                    fetch: deps.bma?.fetch,
+                    now: () => now().getTime(),
+                })
+                bma.start()
+            }
             log.info('tunnel.configured', {
                 studyId: next.studyId,
                 jobId: next.jobId,
@@ -181,6 +206,7 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             lifecycle.transition('CLOSING', reason)
         },
         stop() {
+            bma?.stop()
             channel?.stop()
         },
     }

@@ -53,7 +53,8 @@ export const startTunnel = async (
     options: { env?: Record<string, string>; deps?: TunnelDeps } = {},
 ): Promise<RunningTunnel> => {
     const config = loadConfig({ PORT: '0', FUSION_LONGPOLL_MS: '150', ...options.env })
-    const tunnel = createTunnel(config, options.deps)
+    // Harness tunnels play the directory themselves unless a test wires a BMA explicitly.
+    const tunnel = createTunnel(config, { bma: null, ...options.deps })
     const port = await listen(tunnel.server, 0)
     return { tunnel, baseUrl: `http://127.0.0.1:${port}`, close: () => close(tunnel.server) }
 }

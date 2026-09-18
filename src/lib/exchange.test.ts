@@ -90,7 +90,7 @@ describe('Exchange (destination)', () => {
         expect(exchange.ack(messageId)).toBe('acked')
         expect(transport.acks).toHaveLength(1)
         expect(exchange.ack(uuidv4())).toBe('unknown')
-        expect(exchange.stats()).toEqual({ pendingAcks: 0, queuedQueries: 0, inFlight: false })
+        expect(exchange.stats()).toEqual({ pendingAcks: 0, queuedQueries: 0, inFlight: false, roundsCompleted: 1 })
     })
 
     it('suppresses duplicate messageIds and rejects queries', () => {
@@ -151,7 +151,7 @@ describe('Exchange (source)', () => {
         expect(delivered.map((m) => m.messageId)).toEqual([q1.messageId, q2.messageId])
         expect(exchange.nextQuery()?.messageId).toBe(q1.messageId)
         expect(exchange.nextQuery()?.messageId).toBe(q1.messageId)
-        expect(exchange.stats()).toEqual({ pendingAcks: 2, queuedQueries: 2, inFlight: false })
+        expect(exchange.stats()).toEqual({ pendingAcks: 2, queuedQueries: 2, inFlight: false, roundsCompleted: 0 })
         expect(exchange.ack(q1.messageId)).toBe('acked')
         expect(transport.acks).toEqual([q1.messageId])
         expect(exchange.nextQuery()?.messageId).toBe(q2.messageId)

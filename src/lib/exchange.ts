@@ -89,6 +89,7 @@ export class Exchange {
     private readonly rounds = new Map<string, SourceRound>() // by correlationId
 
     // both
+    private roundsCompleted = 0
     private readonly seen = new Set<string>() // every delivered messageId, acked or not
     private readonly pending = new Map<string, DeliveredMessage>() // delivered, not yet acked, by messageId
 
@@ -171,6 +172,7 @@ export class Exchange {
         this.transport.send({ kind: 'response', messageId, correlationId: inReplyTo, payload })
         round.responseMessageId = messageId
         round.responsePayload = payload
+        this.roundsCompleted++
         return { messageId, replayed: false }
     }
 
@@ -259,6 +261,7 @@ export class Exchange {
         } else {
             this.responses.delete(delivered.correlationId)
             this.remember(this.consumedCorrelations, delivered.correlationId)
+            this.roundsCompleted++
         }
         this.transport.ack(messageId)
         return 'acked'
@@ -271,11 +274,13 @@ export class Exchange {
 
     // ---- observability (content-free) ----------------------------------------------------
 
-    stats(): { pendingAcks: number; queuedQueries: number; inFlight: boolean } {
+    /** Rounds completed from this side's view: responses consumed (destination) or sent (source). */
+    stats(): { pendingAcks: number; queuedQueries: number; inFlight: boolean; roundsCompleted: number } {
         return {
             pendingAcks: this.pending.size,
             queuedQueries: this.inboundQueries.length,
             inFlight: this.outstanding !== null,
+            roundsCompleted: this.roundsCompleted,
         }
     }
 
