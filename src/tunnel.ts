@@ -4,6 +4,7 @@ import { createHttpServer } from '@/http/server'
 import type { Router } from '@/http/router'
 import { canonicalJson } from '@/lib/canonical'
 import { BmaClient } from '@/lib/bma/client'
+import { installRecovery } from '@/lib/recovery'
 import { Channel, type ChannelDeps, type VerifiedPeer } from '@/lib/channel'
 import { createIdentity, type Identity } from '@/lib/identity'
 import { Exchange, nullTransport, type ExchangeTransport } from '@/lib/exchange'
@@ -153,11 +154,6 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
                 tokenProvider: () => bma?.currentRelayToken() ?? next.relay.token,
                 ...deps.channelDeps,
             })
-            channel.on('control', (control, messageId, reason) => {
-                if (control === 'CLOSE' && lifecycle.state === 'CHANNEL_UP') {
-                    lifecycle.transition('CLOSING', `peer CLOSE received (${messageId}${reason ? `: ${reason}` : ''})`)
-                }
-            })
             exchange.setTransport(deps.transport ?? channel.delivery)
             transport = deps.transport ?? channel.delivery
             lifecycle.transition('CONFIGURED', 'configuration bundle accepted')
@@ -176,6 +172,7 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
                 })
                 bma.start()
             }
+            installRecovery({ channel, bma, lifecycle })
             log.info('tunnel.configured', {
                 studyId: next.studyId,
                 jobId: next.jobId,
@@ -204,6 +201,7 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
         },
         complete(reason) {
             lifecycle.transition('CLOSING', reason)
+            channel?.close(reason)
         },
         stop() {
             bma?.stop()

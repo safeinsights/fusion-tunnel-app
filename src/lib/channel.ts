@@ -28,6 +28,8 @@ export type VerifiedPeer = {
 
 export interface ChannelEvents {
     attached: []
+    closeAcked: []
+    closed: [reason: string]
     channelUp: [epochTag: string]
     peerRejoined: [peerRole: 'source' | 'destination']
     handshakeFailed: [reason: string]
@@ -62,6 +64,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
     private cachedMsg2: { msg1: Buffer; msg2: Buffer } | undefined
     private handshakeTimer: NodeJS.Timeout | null = null
     private handshakeAttempts = 0
+    private closeTimer: NodeJS.Timeout | null = null
+    private closing = false
     private stopped = false
 
     constructor(private readonly deps: ChannelDeps) {
@@ -136,7 +140,13 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.relay.on('disconnected', () => this.emit('disconnected'))
         this.relay.on('fatal', (reason) => {
             this.emit('relayFatal', reason)
+            if (reason === 'SESSION_CLOSED') return this.finishClosed('relay purged the session')
             this.deps.lifecycle.fail('ERRORED', `relay: ${reason}`)
+        })
+        // A failed session tells the relay to purge (best effort); the relay's own fatal codes need no reply.
+        this.deps.lifecycle.onTransition((transition) => {
+            if (transition.to === 'ERRORED' || transition.to === 'LIMIT_EXCEEDED')
+                this.sendCloseBestEffort(transition.reason)
         })
     }
 
@@ -192,9 +202,86 @@ export class Channel extends EventEmitter<ChannelEvents> {
     stop(): void {
         this.stopped = true
         this.clearHandshakeTimer()
+        this.clearCloseTimer()
         this.delivery.stop()
         this.relay.stop()
         this.tearDownSession()
+    }
+
+    // ---- CLOSE (v2 §7.6) -----------------------------------------------------------------
+
+    /**
+     * Destination: start the CLOSE sequence — an authenticated CLOSE to the peer through the relay,
+     * then wait for the peer's CLOSE_ACK / the relay's SESSION_CLOSED, bounded by the close timeout.
+     * The lifecycle is CLOSING from the caller's transition until finishClosed().
+     */
+    close(reason = 'rc requested completion'): void {
+        if (this.closing || this.stopped) return
+        this.closing = true
+        const payload = this.delivery.sealClose(reason) ?? Buffer.alloc(0)
+        const sent = this.relay.send({ type: 'CLOSE', header: {}, payload })
+        log.info('channel.close_sent', { sent, authenticated: payload.byteLength > 0 })
+        this.armCloseTimer()
+    }
+
+    private sendCloseBestEffort(reason: string): void {
+        if (this.closing) return
+        this.closing = true
+        const payload = this.delivery.sealClose(reason) ?? Buffer.alloc(0)
+        const sent = this.relay.send({ type: 'CLOSE', header: {}, payload })
+        log.info('channel.close_sent', { sent, authenticated: payload.byteLength > 0, terminal: true })
+    }
+
+    private onCloseFrame(payload: Buffer): void {
+        const verified = this.delivery.openClose(payload)
+        // Acknowledge regardless so the relay can purge promptly; only a verified CLOSE moves the lifecycle.
+        this.relay.send({ type: 'CLOSE_ACK', header: {} })
+        if (!verified) {
+            log.warn('channel.close_unverified', { bytes: payload.byteLength })
+            return
+        }
+        log.info('channel.close_received', { messageId: verified.messageId })
+        if (this.deps.lifecycle.state === 'CHANNEL_UP') {
+            this.deps.lifecycle.transition(
+                'CLOSING',
+                `peer CLOSE received (${verified.messageId}${verified.reason ? `: ${verified.reason}` : ''})`,
+            )
+        }
+        this.closing = true
+        this.armCloseTimer()
+        this.emit('control', 'CLOSE', verified.messageId, verified.reason)
+    }
+
+    private armCloseTimer(): void {
+        if (this.closeTimer) return
+        this.closeTimer = setTimeout(() => {
+            this.closeTimer = null
+            this.finishClosed('close timeout')
+        }, this.deps.tuning.closeTimeoutMs)
+        this.closeTimer.unref()
+    }
+
+    private finishClosed(reason: string): void {
+        this.clearCloseTimer()
+        const lifecycle = this.deps.lifecycle
+        if (lifecycle.isTerminal()) return
+        if (lifecycle.state !== 'CLOSING') {
+            // The relay ended the session before any CLOSE reached us: a study ending we cannot
+            // authenticate. Ending early is the only thing a relay can force, so log it loudly.
+            log.warn('channel.closed_without_close', { state: lifecycle.state, reason })
+            if (!lifecycle.canTransition('CLOSING'))
+                return void lifecycle.fail('ERRORED', `session closed by relay: ${reason}`)
+            lifecycle.transition('CLOSING', `relay closed the session: ${reason}`)
+        }
+        lifecycle.transition('CLOSED', reason)
+        log.info('channel.closed', { reason })
+        this.emit('closed', reason)
+        this.relay.stop()
+    }
+
+    private clearCloseTimer(): void {
+        if (this.closeTimer) clearTimeout(this.closeTimer)
+        this.closeTimer = null
     }
 
     private sendMsg1(): void {
@@ -218,9 +305,11 @@ export class Channel extends EventEmitter<ChannelEvents> {
             case 'PEER_REJOINED':
                 return this.onPeerRejoined(frame.header.peerRole)
             case 'CLOSE':
+                return this.onCloseFrame(frame.payload)
             case 'CLOSE_ACK':
-                // Phase 8 wires the CLOSE sequence; for now surface the peer's close as a control.
-                if (frame.type === 'CLOSE') this.emit('control', 'CLOSE', 'relay-close', undefined)
+                // The peer acknowledged; the relay purges next and closes us with SESSION_CLOSED.
+                log.info('channel.close_acked', {})
+                this.emit('closeAcked')
                 return
             default:
                 return this.delivery.onFrame(frame)

@@ -29,11 +29,14 @@ export interface ExchangeTransport {
     send(message: OutboundMessage): void
     /** Forward a stage-two ACK (RC consumption) end to end. */
     ack(messageId: string): void
+    /** True while the outbox still holds this sent message (not yet acknowledged end to end). */
+    holds(messageId: string): boolean
 }
 
 export const nullTransport: ExchangeTransport = {
     send: () => {},
     ack: () => {},
+    holds: () => false,
 }
 
 export class InFlightConflictError extends Error {
@@ -118,6 +121,12 @@ export class Exchange {
         this.assertRole('destination', 'request')
         if (this.outstanding) {
             if (correlationId !== undefined && correlationId === this.outstanding.correlationId) {
+                if (this.transport.holds(this.outstanding.messageId)) return { correlationId, reissued: true }
+                // The query was consumed at the source but no response came (v2 §8 row 3: the source RC
+                // died after acking). Resend under a fresh messageId; the source re-queues it for its RC.
+                const messageId = uuidv4()
+                this.transport.send({ kind: 'query', messageId, correlationId, payload })
+                this.outstanding = { correlationId, messageId }
                 return { correlationId, reissued: true }
             }
             throw new InFlightConflictError(this.outstanding.correlationId)
@@ -210,11 +219,11 @@ export class Exchange {
         const round = this.rounds.get(query.correlationId)
         if (round) {
             // The destination re-issued a round we already know (fresh messageId, same correlationId).
-            // Stage two for the new query id is ours to complete; the RC never sees it twice.
             round.queryMessageId = query.messageId
-            this.transport.ack(query.messageId)
             if (round.responseMessageId !== undefined && round.responsePayload !== undefined) {
-                // Cached-response replay (v2 §7.3): a new frame, same correlation, no RC involvement.
+                // Answered: stage two for the new query id is ours, and the cached response is replayed
+                // as a new frame (v2 §7.3) — the RC never runs the operation twice.
+                this.transport.ack(query.messageId)
                 const messageId = uuidv4()
                 round.responseMessageId = messageId
                 this.transport.send({
@@ -223,11 +232,20 @@ export class Exchange {
                     correlationId: query.correlationId,
                     payload: round.responsePayload,
                 })
+                return 'stale'
             }
-            return 'stale'
+            // Unanswered: the RC may have died after acking (v2 §8 row 3). Retire the earlier copy and
+            // deliver again under the new id; a live RC dedups by correlationId in the SDK.
+            const earlier = this.inboundQueries.findIndex((q) => q.correlationId === query.correlationId)
+            if (earlier >= 0) {
+                const [old] = this.inboundQueries.splice(earlier, 1)
+                this.pending.delete(old.messageId)
+                this.transport.ack(old.messageId)
+            }
+        } else {
+            this.rounds.set(query.correlationId, { queryMessageId: query.messageId })
+            this.trim(this.rounds)
         }
-        this.rounds.set(query.correlationId, { queryMessageId: query.messageId })
-        this.trim(this.rounds)
         this.inboundQueries.push(query)
         this.pending.set(query.messageId, query)
         this.onDelivered(query)

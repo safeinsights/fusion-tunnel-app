@@ -63,6 +63,10 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
     private messagesReceived = 0
     private readonly fetchImpl: typeof fetch
     private readonly now: () => number
+    private terminalReportDone!: () => void
+    private readonly terminalReport = new Promise<void>((resolve) => {
+        this.terminalReportDone = resolve
+    })
 
     constructor(private readonly deps: BmaClientDeps) {
         super()
@@ -82,11 +86,6 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
     }
 
     start(): void {
-        this.deps.channel.on('peerRejoined', () => {
-            // The peer restarted: its new key has a higher directory generation. Poll until it appears.
-            this.requireNewer = true
-            this.startPeerKeyPoll()
-        })
         this.deps.channel.on('delivery', (event) => {
             if (event.type === 'sent' && !event.resend) this.messagesSent++
             if (event.type === 'acked') this.messagesAcked++
@@ -122,7 +121,18 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         return { rejected: this.peerKeyRejected, lastSeenGeneration: this.lastSeenGeneration }
     }
 
+    /** Resolves once the terminal status report has been attempted (sent or failed). */
+    terminalReported(): Promise<void> {
+        return this.terminalReport
+    }
+
     // ---- peer key ------------------------------------------------------------------------
+
+    /** The peer restarted: its new key has a higher directory generation. Poll until it appears. */
+    refetchPeerKey(): void {
+        this.requireNewer = true
+        this.startPeerKeyPoll()
+    }
 
     private startPeerKeyPoll(): void {
         if (this.stopped || this.polling) return
@@ -288,6 +298,8 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         } catch (error) {
             this.emit('requestFailed', 'status', error)
             log.warn('bma.status_report_failed', { reason, ...errorFields(error) })
+        } finally {
+            if (reason === 'terminal') this.terminalReportDone()
         }
     }
 

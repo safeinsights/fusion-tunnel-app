@@ -136,7 +136,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private heartbeat: NodeJS.Timeout | null = null
     private pingEnabled = true
     private port = 0
-    private ackDrops: Partial<Record<RelayRole, number>> = {}
+    private frameDrops = new Map<string, number>() // `${role}:${type}` → count
     /** Blob store: relaySessionId → blobId → ciphertext bytes (opaque). */
     readonly blobStore = new Map<string, Map<string, Buffer>>()
     private blobFailures: Record<'put' | 'get', number> = { put: 0, get: 0 }
@@ -197,9 +197,14 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         this.pingEnabled = enabled
     }
 
-    /** Swallow the next `count` ACK frames sent by `role` (simulates a lost end-to-end ACK). */
+    /** Swallow the next `count` frames of `type` sent by `role` (a lost ACK, a lost CLOSE_ACK…). */
+    dropNext(role: RelayRole, type: Frame['type'], count = 1): void {
+        const key = `${role}:${type}`
+        this.frameDrops.set(key, (this.frameDrops.get(key) ?? 0) + count)
+    }
+
     dropNextAcks(role: RelayRole, count = 1): void {
-        this.ackDrops[role] = (this.ackDrops[role] ?? 0) + count
+        this.dropNext(role, 'ACK', count)
     }
 
     /** Fail the next `count` blob requests of a kind with 503. */
@@ -505,14 +510,16 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         const session = this.sessions.get(claims.relaySessionId)
         if (!session) return
         const role = claims.role
+        const dropKey = `${role}:${frame.type}`
+        const drops = this.frameDrops.get(dropKey) ?? 0
+        if (drops > 0) {
+            this.frameDrops.set(dropKey, drops - 1)
+            return
+        }
         switch (frame.type) {
             case 'DATA':
                 return this.onData(session, role, frame.header, frame.payload)
             case 'ACK':
-                if ((this.ackDrops[role] ?? 0) > 0) {
-                    this.ackDrops[role]!--
-                    return
-                }
                 return this.onAck(session, role, frame.header.messageId)
             case 'NACK_DISCARD':
                 return this.onNack(session, role, frame.header.messageId)

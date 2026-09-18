@@ -185,7 +185,7 @@ export const StatusReportSchema = z.strictObject({
             reason: z.string().max(256),
         })
         .optional(),
-    reason: z.enum(['interval', 'near_limit', 'transition', 'terminal', 'round']),
+    reason: z.enum(['interval', 'near_limit', 'transition', 'terminal', 'round', 'shutdown']),
     reportedAt: z.iso.datetime(),
 })
 export type StatusReport = z.infer<typeof StatusReportSchema>

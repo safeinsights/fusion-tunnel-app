@@ -47,6 +47,17 @@ describe('Exchange (destination)', () => {
         expect(transport.sent).toHaveLength(1)
     })
 
+    it('resends a re-issued round under a fresh messageId once the query left the outbox unanswered', () => {
+        const { transport, exchange } = destination()
+        const { correlationId } = exchange.request({ q: 1 })
+        transport.ackedByPeer.add(transport.sent[0].messageId) // the source RC acked… and then died
+        expect(exchange.request({ q: 1 }, correlationId)).toEqual({ correlationId, reissued: true })
+        expect(transport.sent).toHaveLength(2)
+        expect(transport.sent[1]).toMatchObject({ kind: 'query', correlationId, payload: { q: 1 } })
+        expect(transport.sent[1].messageId).not.toBe(transport.sent[0].messageId)
+        expect(exchange.hasOutstanding()).toBe(true)
+    })
+
     it('starts a fresh round under a client-supplied correlationId it does not know (post-restart re-issue)', () => {
         const { transport, exchange } = destination()
         const cid = uuidv4()
@@ -194,15 +205,24 @@ describe('Exchange (source)', () => {
         expect(exchange.nextQuery()).toBeUndefined()
     })
 
-    it('acks a re-issued query still being processed without queuing it twice', () => {
-        const { transport, exchange } = source()
+    it('delivers a re-issued unanswered query again under its new id, retiring the earlier copy', () => {
+        const { transport, delivered, exchange } = source()
         const q = { kind: 'query' as const, messageId: uuidv4(), correlationId: uuidv4(), payload: 1 }
         exchange.deliver(q)
+        exchange.ack(q.messageId) // the RC acked… and then died before responding
         const reissued = { ...q, messageId: uuidv4() }
-        expect(exchange.deliver(reissued)).toBe('stale')
-        expect(transport.acks).toEqual([reissued.messageId])
+        expect(exchange.deliver(reissued)).toBe('delivered')
+        expect(delivered.map((m) => m.messageId)).toEqual([q.messageId, reissued.messageId])
+        expect(exchange.nextQuery()?.messageId).toBe(reissued.messageId)
         expect(transport.sent).toHaveLength(0)
-        expect(exchange.stats().queuedQueries).toBe(1)
+        // an un-acked earlier copy is retired and acked on the RC's behalf
+        const q2 = { kind: 'query' as const, messageId: uuidv4(), correlationId: uuidv4(), payload: 2 }
+        exchange.deliver(q2)
+        const q2again = { ...q2, messageId: uuidv4() }
+        expect(exchange.deliver(q2again)).toBe('delivered')
+        expect(transport.acks).toContain(q2.messageId)
+        expect(exchange.stats().queuedQueries).toBe(2)
+        expect(exchange.latestQueryMessageId(q2.correlationId)).toBe(q2again.messageId)
     })
 
     it('rejects responses and refuses destination operations', () => {

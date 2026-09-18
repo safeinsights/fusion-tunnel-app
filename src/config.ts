@@ -52,6 +52,8 @@ export type Tuning = {
     /** Blob store PUT/GET retry cadence and attempt bound (v2 §7.2). */
     blobRetryMs: number
     blobMaxAttempts: number
+    /** Keep the local API up this long after a terminal state so the RC can read the terminal body. */
+    exitGraceMs: number
 }
 
 // PROVISIONAL — §15.6, tune during load testing
@@ -76,6 +78,7 @@ export const TUNING_DEFAULTS: Readonly<Tuning> = Object.freeze({
     inboxMaxPartialBytes: 64 * 1024 * 1024,
     blobRetryMs: 500,
     blobMaxAttempts: 8,
+    exitGraceMs: 5_000,
 })
 
 export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze({
@@ -99,6 +102,7 @@ export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze(
     inboxMaxPartialBytes: 'FUSION_INBOX_MAX_BYTES',
     blobRetryMs: 'FUSION_BLOB_RETRY_MS',
     blobMaxAttempts: 'FUSION_BLOB_MAX_ATTEMPTS',
+    exitGraceMs: 'FUSION_EXIT_GRACE_MS',
 })
 
 type Env = Record<string, string | undefined>
@@ -168,6 +172,7 @@ export const loadTuning = (env: Env = process.env): Tuning => {
         ),
         blobRetryMs: envPositiveInt(env, TUNING_ENV.blobRetryMs, TUNING_DEFAULTS.blobRetryMs),
         blobMaxAttempts: envPositiveInt(env, TUNING_ENV.blobMaxAttempts, TUNING_DEFAULTS.blobMaxAttempts),
+        exitGraceMs: envPositiveInt(env, TUNING_ENV.exitGraceMs, TUNING_DEFAULTS.exitGraceMs),
     }
     if (tuning.reconnectMaxMs < tuning.reconnectMinMs) {
         throw new ConfigError(`${TUNING_ENV.reconnectMaxMs} must be >= ${TUNING_ENV.reconnectMinMs}`)

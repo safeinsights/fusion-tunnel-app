@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from 'uuid'
+import { parse as parseUuid, stringify as stringifyUuid, v4 as uuidv4 } from 'uuid'
 import { Exchange, type OutboundMessage, type ExchangeTransport } from '@/lib/exchange'
 import { log } from '@/lib/logger'
 import { encodeChunkHeader } from '@/lib/noise/chunk-header'
@@ -198,6 +198,10 @@ export class Delivery implements ExchangeTransport {
         if (!this.options.sender.send({ type: 'ACK', header: { messageId } })) this.pendingAcks.add(messageId)
     }
 
+    holds(messageId: string): boolean {
+        return this.outbox.has(messageId)
+    }
+
     private enqueue(
         messageId: string,
         kind: OutboundMessage['kind'] | 'control',
@@ -312,6 +316,60 @@ export class Delivery implements ExchangeTransport {
             code: result.code,
         })
         this.options.onFatal?.(`blob upload rejected (${result.code ?? result.status})`)
+    }
+
+    // ---- authenticated CLOSE (v2 §7.6) --------------------------------------------------
+
+    /**
+     * The CLOSE frame's payload: `messageId(16) ‖ transport frame` carrying a control CLOSE sealed
+     * under the current epoch, so the peer can trust that the study really ended. Undefined when no
+     * channel is established (the relay still purges; the peer then ends on SESSION_CLOSED).
+     */
+    sealClose(reason?: string): Buffer | undefined {
+        const session = this.session
+        if (!session?.complete) return undefined
+        const messageId = uuidv4()
+        const message: ChannelMessage = {
+            v: CHANNEL_MESSAGE_VERSION,
+            kind: 'control',
+            control: 'CLOSE',
+            ...(reason ? { reason: reason.slice(0, 256) } : {}),
+            ...(this.options.caps ? { budget: this.options.caps.budget() } : {}),
+        }
+        const aad = encodeChunkHeader({
+            messageId,
+            chunkIndex: 0,
+            chunkCount: 1,
+            senderConnectionId: this.options.connectionId,
+        })
+        const frame = session.encrypt(pad(Buffer.from(JSON.stringify(message), 'utf8'), this.options.buckets), aad)
+        return Buffer.concat([Buffer.from(parseUuid(messageId)), frame])
+    }
+
+    /** Verify a peer's CLOSE payload; undefined when it cannot be authenticated (logged, not trusted). */
+    openClose(payload: Buffer): { messageId: string; reason?: string } | undefined {
+        const session = this.session
+        if (!session?.complete || !this.peerConnectionId || payload.byteLength < 16) return undefined
+        let messageId: string
+        try {
+            messageId = stringifyUuid(payload.subarray(0, 16))
+        } catch {
+            return undefined
+        }
+        const aad = encodeChunkHeader({
+            messageId,
+            chunkIndex: 0,
+            chunkCount: 1,
+            senderConnectionId: this.peerConnectionId,
+        })
+        try {
+            const plaintext = unpad(session.decrypt(payload.subarray(16), aad))
+            const parsed = ChannelMessageSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
+            if (!parsed.success || parsed.data.kind !== 'control' || parsed.data.control !== 'CLOSE') return undefined
+            return { messageId, ...(parsed.data.reason ? { reason: parsed.data.reason } : {}) }
+        } catch {
+            return undefined
+        }
     }
 
     // ---- outbound frames -----------------------------------------------------------------

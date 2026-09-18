@@ -39,11 +39,16 @@ export const makeBundle = (overrides: Partial<ConfigurationBundle> = {}): Config
 export class RecordingTransport implements ExchangeTransport {
     readonly sent: OutboundMessage[] = []
     readonly acks: string[] = []
+    /** Sent messageIds the peer has acknowledged end to end (tests populate this). */
+    readonly ackedByPeer = new Set<string>()
     send(message: OutboundMessage): void {
         this.sent.push(message)
     }
     ack(messageId: string): void {
         this.acks.push(messageId)
+    }
+    holds(messageId: string): boolean {
+        return this.sent.some((m) => m.messageId === messageId) && !this.ackedByPeer.has(messageId)
     }
 }
 
