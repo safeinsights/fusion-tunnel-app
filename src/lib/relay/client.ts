@@ -142,7 +142,12 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
             if (id !== this.dialId) return ws.terminate()
             this.touch()
             this.setState('authenticating')
-            ws.send(encodeFrame({ type: 'HELLO', header: { token } }))
+            ws.send(
+                encodeFrame({
+                    type: 'HELLO',
+                    header: { token, relaySessionId: this.options.relaySessionId, role: this.options.role },
+                }),
+            )
         })
         ws.on('message', (data) => {
             if (id !== this.dialId) return
@@ -284,7 +289,9 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
 
     private startHeartbeat(intervalMs: number): void {
         this.stopHeartbeat()
-        const interval = intervalMs > 0 ? intervalMs : this.options.tuning.heartbeatMs
+        // The relay advertises its ping cadence; 0 means it sends none, so there is nothing to watch.
+        if (intervalMs === 0) return
+        const interval = intervalMs
         const limit = interval * this.options.tuning.heartbeatMisses
         this.heartbeatTimer = setInterval(() => {
             if (this.now() - this.lastActivity > limit) {

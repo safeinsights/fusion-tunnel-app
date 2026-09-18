@@ -2,8 +2,9 @@ import { createPublicKey, verify as edVerify } from 'node:crypto'
 import { z } from 'zod'
 
 // MIRROR of the canonical relay wire contract in fusion-relay/src/protocol/ (plan §0.3) — frame
-// codec, frame types, token claims, PoP payload, error codes. Review against that module; the
-// in-repo fake relay is built on this file so it doubles as the relay team's executable contract.
+// codec, frame types, token claims, PoP payload, error codes. Reviewed against that module on
+// branch feat/relay-implementation (2026-09-18); the in-repo fake relay is built on this file so it
+// doubles as the relay team's executable contract.
 //
 // Frame codec: [version u8=1][type u8][headerLen u32BE][header JSON utf8][payload bytes].
 // Payload is opaque bytes end to end — the codec never inspects it.
@@ -103,6 +104,7 @@ export const RelayErrorCodeSchema = z.enum([
     'RATE_LIMITED',
     'SESSION_ERRORED_DEAD_LETTER',
     'SESSION_ERRORED_EXPIRY',
+    'SESSION_ERRORED_DETACHED',
     'SESSION_CLOSED',
     'SESSION_UNPAIRED_TIMEOUT',
     'PROTOCOL_VIOLATION',
@@ -115,52 +117,84 @@ export type RelayErrorCode = z.infer<typeof RelayErrorCodeSchema>
 export const SESSION_FATAL_CODES: ReadonlySet<RelayErrorCode> = new Set<RelayErrorCode>([
     'SESSION_ERRORED_DEAD_LETTER',
     'SESSION_ERRORED_EXPIRY',
+    'SESSION_ERRORED_DETACHED',
     'SESSION_CLOSED',
     'SESSION_UNPAIRED_TIMEOUT',
 ])
 
-// ---- headers ----------------------------------------------------------------------------------
+/** Application WebSocket close codes the relay uses when an error also terminates the socket. */
+export const CLOSE_CODES = {
+    AUTH_TOKEN_INVALID: 4001,
+    AUTH_TOKEN_EXPIRED: 4002,
+    AUTH_POP_FAILED: 4003,
+    AUTH_ROLE_OCCUPIED_DISPLACED: 4004,
+    PROTOCOL_VIOLATION: 4005,
+    FRAME_TOO_LARGE: 4006,
+    CHALLENGE_TIMEOUT: 4007,
+    SESSION_CLOSED: 4010,
+    SESSION_ERRORED_DEAD_LETTER: 4011,
+    SESSION_ERRORED_EXPIRY: 4012,
+    SESSION_UNPAIRED_TIMEOUT: 4013,
+    SESSION_ERRORED_DETACHED: 4014,
+    HEARTBEAT_TIMEOUT: 4020,
+    SERVER_SHUTDOWN: 4021,
+} as const
 
-export const RelayLimitsSchema = z.object({
-    windowMsgs: z.int().positive(),
-    windowBytes: z.int().positive(),
+// ---- headers (all strict, as in the canonical module) --------------------------------------------
+
+const MessageId = z.string().min(1).max(64)
+
+export const RelayLimitsSchema = z.strictObject({
+    windowMsgs: z.int().nonnegative(),
+    windowBytes: z.int().nonnegative(),
     maxChunkBytes: z.int().positive(),
     inlineCapBytes: z.int().positive(),
 })
 export type RelayLimits = z.infer<typeof RelayLimitsSchema>
 
-export const HelloHeaderSchema = z.object({ token: z.string().min(1).max(8192) })
-export const ChallengeHeaderSchema = z.object({ nonce: base64urlBytes(32) })
-export const ChallengeResponseHeaderSchema = z.object({ signature: base64urlBytes(64) })
-export const AdmittedHeaderSchema = z.object({
+/** A tunnel may declare the session and role it was provisioned for; a mismatch with the token is rejected. */
+export const HelloHeaderSchema = z.strictObject({
+    token: z.string().min(1).max(8192),
+    relaySessionId: Id.optional(),
+    role: RelayRoleSchema.optional(),
+})
+export const ChallengeHeaderSchema = z.strictObject({ nonce: base64urlBytes(32) })
+export const ChallengeResponseHeaderSchema = z.strictObject({ signature: base64urlBytes(64) })
+export const AdmittedHeaderSchema = z.strictObject({
     relaySessionId: Id,
     legId: Id,
     role: RelayRoleSchema,
-    heartbeatIntervalMs: z.int().positive(),
+    /** 0 means the relay sends no heartbeats. */
+    heartbeatIntervalMs: z.int().nonnegative(),
     limits: RelayLimitsSchema,
 })
+/** The tunnel's own epoch tags are 16 hex characters (first 8 bytes of the handshake hash). */
 export const EpochTagSchema = z.string().regex(/^[0-9a-f]{16}$/)
-export const DataHeaderSchema = z.object({
-    messageId: z.uuid(),
-    chunkIndex: z.int().nonnegative(),
-    chunkCount: z.int().positive(),
-    epochTag: EpochTagSchema,
-    /** Plaintext messageId of the query this response answers — the relay's retention rule. */
-    respondsTo: z.uuid().optional(),
-    /** Declared total ciphertext size of the message; reserves the window slot at the lead chunk. */
-    sizeBytes: z.int().nonnegative(),
-    /** Relay-assigned; present only on relay→tunnel pushes. */
-    seq: z.int().nonnegative().optional(),
-})
-export const AckHeaderSchema = z.object({ messageId: z.uuid() })
-export const NackDiscardHeaderSchema = z.object({ messageId: z.uuid(), reason: z.string().min(1).max(64) })
-export const EmptyHeaderSchema = z.object({})
-export const PeerRejoinedHeaderSchema = z.object({ peerRole: RelayRoleSchema })
-export const ErrorHeaderSchema = z.object({
+export const DataHeaderSchema = z
+    .strictObject({
+        messageId: MessageId,
+        chunkIndex: z.int().nonnegative(),
+        chunkCount: z.int().positive(),
+        epochTag: z.string().min(1).max(128),
+        /** Plaintext messageId of the query this response answers — the relay's retention rule. */
+        respondsTo: MessageId.optional(),
+        /** Declared total ciphertext size of the message; reserves the window slot at the lead chunk. */
+        sizeBytes: z.int().nonnegative(),
+        /** Relay-assigned; present only on relay→tunnel pushes. */
+        seq: z.int().nonnegative().optional(),
+    })
+    .refine((h) => h.chunkIndex < h.chunkCount, { message: 'chunkIndex must be < chunkCount' })
+export const AckHeaderSchema = z.strictObject({ messageId: MessageId })
+export const NackDiscardHeaderSchema = z.strictObject({ messageId: MessageId, reason: z.string().min(1).max(256) })
+export const EmptyHeaderSchema = z.strictObject({})
+export const PeerRejoinedHeaderSchema = z.strictObject({ peerRole: RelayRoleSchema, epoch: z.int().nonnegative() })
+export const ErrorHeaderSchema = z.strictObject({
     code: RelayErrorCodeSchema,
     retryable: z.boolean(),
-    detail: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
-    messageId: z.uuid().optional(),
+    detail: z.string().max(512).optional(),
+    messageId: MessageId.optional(),
+    /** QUOTA_EXCEEDED only: which budget was breached. */
+    scope: z.enum(['session', 'study']).optional(),
 })
 
 export type HelloHeader = z.infer<typeof HelloHeaderSchema>

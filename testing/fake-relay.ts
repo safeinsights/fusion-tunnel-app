@@ -10,6 +10,7 @@ import {
     verifyPop,
     RelayTokenClaimsSchema,
     RELAY_TOKEN_AUDIENCE,
+    CLOSE_CODES,
     type DataHeader,
     type ErrorHeader,
     type Frame,
@@ -70,6 +71,8 @@ export type Session = {
     nextSeq: Record<Direction, number>
     closeAcks: Partial<Record<RelayRole, boolean>>
     closeTimer?: NodeJS.Timeout
+    /** The authenticated CLOSE payload, held for a peer that attaches during `closing`. */
+    pendingClose?: { from: RelayRole; payload: Buffer }
     createdAt: number
 }
 
@@ -92,9 +95,9 @@ export const DEFAULT_LIMITS: RelayLimits = {
     inlineCapBytes: 256 * 1024,
 }
 
-export const DISPLACED_CLOSE_CODE = 4000
-export const REJECTED_CLOSE_CODE = 4001
-export const SESSION_ENDED_CLOSE_CODE = 4002
+/** Close codes follow the canonical CLOSE_CODES table; unmapped rejections use PROTOCOL_VIOLATION's. */
+const closeCodeFor = (code: RelayErrorCode): number =>
+    (CLOSE_CODES as Record<string, number>)[code] ?? CLOSE_CODES.PROTOCOL_VIOLATION
 
 export interface FakeRelayEvents {
     admitted: [relaySessionId: string, role: RelayRole, fingerprint: string]
@@ -144,8 +147,10 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         const address = this.http.address()
         this.port = typeof address === 'object' && address ? address.port : port
         const interval = this.options.heartbeatIntervalMs ?? 30_000
-        this.heartbeat = setInterval(() => this.pingAll(), interval)
-        this.heartbeat.unref()
+        if (interval > 0) {
+            this.heartbeat = setInterval(() => this.pingAll(), interval)
+            this.heartbeat.unref()
+        }
         return { port: this.port, wsUrl: this.wsUrl, httpUrl: this.httpUrl }
     }
 
@@ -240,12 +245,12 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         try {
             frame = decodeFrame(data)
         } catch {
-            return this.reject(conn, 'PROTOCOL_VIOLATION', false, { detail: { reason: 'malformed frame' } })
+            return this.reject(conn, 'PROTOCOL_VIOLATION', false, { detail: 'malformed frame' })
         }
         switch (conn.phase) {
             case 'hello':
                 if (frame.type !== 'HELLO') return this.reject(conn, 'PROTOCOL_VIOLATION', false)
-                return this.onHello(conn, frame.header.token)
+                return this.onHello(conn, frame.header)
             case 'challenge':
                 if (frame.type !== 'CHALLENGE_RESPONSE') return this.reject(conn, 'PROTOCOL_VIOLATION', false)
                 return this.onChallengeResponse(conn, Buffer.from(frame.header.signature, 'base64url'))
@@ -254,10 +259,10 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
     }
 
-    private onHello(conn: Conn, token: string): void {
+    private onHello(conn: Conn, hello: { token: string; relaySessionId?: string; role?: RelayRole }): void {
         let decoded: unknown
         try {
-            decoded = jwt.verify(token, this.options.bmaPublicKeyPem, {
+            decoded = jwt.verify(hello.token, this.options.bmaPublicKeyPem, {
                 algorithms: ['RS256'],
                 audience: RELAY_TOKEN_AUDIENCE,
                 maxAge: `${this.options.tokenMaxAgeS ?? 900}s`,
@@ -269,11 +274,20 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
         const claims = RelayTokenClaimsSchema.safeParse(decoded)
         if (!claims.success) return this.reject(conn, 'AUTH_TOKEN_INVALID', false)
+        // A declared session/role must match the token: a session-A token on session B is refused here.
+        if (
+            (hello.relaySessionId !== undefined && hello.relaySessionId !== claims.data.relaySessionId) ||
+            (hello.role !== undefined && hello.role !== claims.data.role)
+        ) {
+            return this.reject(conn, 'AUTH_TOKEN_INVALID', false, {
+                detail: 'declared session or role does not match the token',
+            })
+        }
         conn.claims = claims.data
         conn.nonce = randomBytes(32)
         conn.phase = 'challenge'
         conn.challengeTimer = setTimeout(
-            () => this.reject(conn, 'AUTH_POP_FAILED', false, { detail: { reason: 'challenge timeout' } }),
+            () => this.reject(conn, 'AUTH_POP_FAILED', false, { detail: 'challenge timeout' }),
             this.options.challengeTimeoutMs ?? 10_000,
         )
         conn.challengeTimer.unref()
@@ -322,7 +336,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
             this.sendError(previous.ws, { code: 'AUTH_ROLE_OCCUPIED_DISPLACED', retryable: false })
             previous.phase = 'hello'
             delete session.sockets[claims.role]
-            previous.ws.close(DISPLACED_CLOSE_CODE, 'displaced')
+            previous.ws.close(CLOSE_CODES.AUTH_ROLE_OCCUPIED_DISPLACED, 'AUTH_ROLE_OCCUPIED_DISPLACED')
             this.emit('displaced', session.relaySessionId, claims.role)
         }
 
@@ -353,8 +367,12 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
         const peer = session.sockets[peerOf(claims.role)]
         if (peer && newFingerprint && !firstAttach) {
-            this.sendFrame(peer.ws, { type: 'PEER_REJOINED', header: { peerRole: claims.role } })
+            this.sendFrame(peer.ws, { type: 'PEER_REJOINED', header: { peerRole: claims.role, epoch: session.epoch } })
             this.emit('peerRejoined', session.relaySessionId, claims.role)
+        }
+        // A peer attaching while the session is closing still receives the held CLOSE.
+        if (session.status === 'closing' && session.pendingClose && session.pendingClose.from !== claims.role) {
+            this.sendFrame(conn.ws, { type: 'CLOSE', header: {}, payload: session.pendingClose.payload })
         }
         this.redeliver(session, claims.role)
     }
@@ -363,7 +381,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         if (conn.challengeTimer) clearTimeout(conn.challengeTimer)
         this.sendError(conn.ws, { code, retryable, ...extra })
         this.emit('rejected', code)
-        conn.ws.close(REJECTED_CLOSE_CODE, code)
+        conn.ws.close(closeCodeFor(code), code)
     }
 
     private onClose(conn: Conn): void {
@@ -403,7 +421,11 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
             case 'CLOSE_ACK':
                 return this.onCloseAck(session, role)
             default:
-                this.sendError(conn.ws, { code: 'PROTOCOL_VIOLATION', retryable: false, detail: { frame: frame.type } })
+                this.sendError(conn.ws, {
+                    code: 'PROTOCOL_VIOLATION',
+                    retryable: false,
+                    detail: `unexpected ${frame.type}`,
+                })
         }
     }
 
@@ -506,16 +528,17 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         if (sender && sender.ws.readyState === WebSocket.OPEN)
             this.sendFrame(sender.ws, { type: 'ACK', header: { messageId } })
         if (!lead) return void this.emit('ack', session.relaySessionId, messageId, 'noop')
-        if (lead.respondsTo) {
-            // A response: delete it and the retained query it answers (the round is complete).
-            this.remove(session, direction, messageId)
-            this.remove(session, direction === 'dstToSrc' ? 'srcToDst' : 'dstToSrc', lead.respondsTo)
-            this.emit('ack', session.relaySessionId, messageId, 'deleted')
-        } else {
+        const isQuery = direction === 'dstToSrc' && lead.respondsTo === undefined
+        if (isQuery) {
             // A query: consumed but retained until its correlated response completes stage two.
             lead.msgState = 'consumed'
             this.emit('ack', session.relaySessionId, messageId, 'consumed')
+            return
         }
+        // Anything else is deleted on ACK; a response also releases the retained query it answers.
+        this.remove(session, direction, messageId)
+        if (lead.respondsTo) this.remove(session, direction === 'dstToSrc' ? 'srcToDst' : 'dstToSrc', lead.respondsTo)
+        this.emit('ack', session.relaySessionId, messageId, 'deleted')
     }
 
     private onNack(session: Session, receiver: RelayRole, messageId: string): void {
@@ -537,8 +560,12 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
 
     private onCloseRequest(session: Session, requester: RelayRole, payload: Buffer): void {
         if (session.status !== 'active' && session.status !== 'closing') return
+        const first = session.status === 'active'
         session.status = 'closing'
-        this.emit('close', session.relaySessionId, 'requested')
+        // The requester's own CLOSE is its acknowledgement; only the peer's CLOSE_ACK is awaited.
+        session.closeAcks[requester] = true
+        session.pendingClose = { from: requester, payload: Buffer.from(payload) }
+        if (first) this.emit('close', session.relaySessionId, 'requested')
         const peer = session.sockets[peerOf(requester)]
         if (peer && peer.ws.readyState === WebSocket.OPEN)
             this.sendFrame(peer.ws, { type: 'CLOSE', header: {}, payload })
@@ -555,8 +582,10 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         if (session.status !== 'closing') return
         session.closeAcks[acker] = true
         this.emit('close', session.relaySessionId, 'acked')
-        const peer = session.sockets[peerOf(acker)]
-        if (peer && peer.ws.readyState === WebSocket.OPEN) this.sendFrame(peer.ws, { type: 'CLOSE_ACK', header: {} })
+        // The requester sees the peer's acknowledgement before the purge closes its socket.
+        const requester = session.sockets[peerOf(acker)]
+        if (requester && requester.ws.readyState === WebSocket.OPEN)
+            this.sendFrame(requester.ws, { type: 'CLOSE_ACK', header: {} })
         if (session.closeAcks.source && session.closeAcks.destination) this.finishClose(session)
     }
 
@@ -576,7 +605,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
             if (!conn) continue
             if (conn.ws.readyState === WebSocket.OPEN) {
                 this.sendError(conn.ws, error)
-                conn.ws.close(SESSION_ENDED_CLOSE_CODE, error.code)
+                conn.ws.close(closeCodeFor(error.code), error.code)
             }
             delete session.sockets[role]
         }

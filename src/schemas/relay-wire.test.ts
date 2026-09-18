@@ -18,7 +18,7 @@ import { createIdentity } from '@/lib/identity'
 const uuid = '3f2b6f7c-1f1c-4e3e-9a4b-1c9d0e8f7a6b'
 
 const samples: Frame[] = [
-    { type: 'HELLO', header: { token: 'jwt' } },
+    { type: 'HELLO', header: { token: 'jwt', relaySessionId: 'rs', role: 'source' } },
     { type: 'CHALLENGE', header: { nonce: randomBytes(32).toString('base64url') } },
     { type: 'CHALLENGE_RESPONSE', header: { signature: randomBytes(64).toString('base64url') } },
     {
@@ -48,8 +48,11 @@ const samples: Frame[] = [
     { type: 'NACK_DISCARD', header: { messageId: uuid, reason: 'stale_epoch' } },
     { type: 'CLOSE', header: {}, payload: Buffer.from('authenticated close') },
     { type: 'CLOSE_ACK', header: {} },
-    { type: 'PEER_REJOINED', header: { peerRole: 'destination' } },
-    { type: 'ERROR', header: { code: 'BACKPRESSURE', retryable: true, messageId: uuid, detail: { scope: 'session' } } },
+    { type: 'PEER_REJOINED', header: { peerRole: 'destination', epoch: 2 } },
+    {
+        type: 'ERROR',
+        header: { code: 'QUOTA_EXCEEDED', retryable: false, messageId: uuid, detail: 'study budget', scope: 'study' },
+    },
     { type: 'HANDSHAKE', header: {}, payload: Buffer.alloc(96, 1) },
 ]
 
@@ -110,6 +113,30 @@ describe('relay frame codec', () => {
     it('maps codes to names', () => {
         expect(frameTypeName(5)).toBe('DATA')
         expect(frameTypeName(0)).toBeUndefined()
+    })
+
+    it('rejects unknown header fields and a chunkIndex past chunkCount (strict, as canonical)', () => {
+        const withExtra = Buffer.concat([Buffer.from([1, 6, 0, 0, 0, 0]), Buffer.alloc(0)])
+        const ack = JSON.stringify({ messageId: uuid, extra: 1 })
+        const buf = Buffer.concat([Buffer.from([1, 6, 0, 0, 0, ack.length]), Buffer.from(ack)])
+        expect(() => decodeFrame(buf)).toThrow(WireError)
+        void withExtra
+        expect(() =>
+            encodeFrame({
+                type: 'DATA',
+                header: { messageId: uuid, chunkIndex: 2, chunkCount: 2, epochTag: 'e', sizeBytes: 1 },
+                payload: Buffer.alloc(1),
+            }),
+        ).not.toThrow()
+        expect(() =>
+            decodeFrame(
+                encodeFrame({
+                    type: 'DATA',
+                    header: { messageId: uuid, chunkIndex: 2, chunkCount: 2, epochTag: 'e', sizeBytes: 1 },
+                    payload: Buffer.alloc(1),
+                }),
+            ),
+        ).toThrow(WireError)
     })
 })
 
