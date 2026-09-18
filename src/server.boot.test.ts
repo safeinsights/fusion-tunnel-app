@@ -13,20 +13,21 @@ describe('server startup', () => {
     it('does not listen under NODE_ENV=test', async () => {
         vi.stubEnv('NODE_ENV', 'test')
         const mod = await import('@/server')
-        expect(mod.app).toBeUndefined()
+        expect(mod.tunnel).toBeUndefined()
     })
 
     it('boots and listens outside of test', async () => {
         vi.stubEnv('NODE_ENV', 'production')
         vi.stubEnv('PORT', '0')
         const mod = await import('@/server')
-        expect(mod.app).toBeDefined()
+        expect(mod.tunnel).toBeDefined()
         await new Promise<void>((resolve) => {
-            if (mod.app!.server.listening) resolve()
-            else mod.app!.server.once('listening', () => resolve())
+            if (mod.tunnel!.server.listening) resolve()
+            else mod.tunnel!.server.once('listening', () => resolve())
         })
-        expect(mod.app!.server.listening).toBe(true)
-        await new Promise<void>((resolve) => mod.app!.server.close(() => resolve()))
+        expect(mod.tunnel!.server.listening).toBe(true)
+        expect(mod.tunnel!.lifecycle.state).toBe('AWAITING_CONFIG')
+        await new Promise<void>((resolve) => mod.tunnel!.server.close(() => resolve()))
     })
 
     it('refuses to boot on an invalid tuning value', async () => {

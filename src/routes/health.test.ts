@@ -1,15 +1,16 @@
-import { health } from './health'
 import { describe, it, expect } from 'vitest'
+import { health } from './health'
+import { createTunnel } from '@/tunnel'
+import { loadConfig } from '@/config'
 
 describe('Healthcheck Endpoint', () => {
-    it('returns the healthcheck response', async () => {
-        const response = await health(new Request('http://localhost/health'), {})
-        const data = await response.json()
-
+    it('returns ok with the current lifecycle state', async () => {
+        const tunnel = createTunnel(loadConfig({ PORT: '0' }))
+        const response = await health(tunnel)(new Request('http://localhost/health'), {})
         expect(response.status).toBe(200)
-        expect(data).toEqual({
+        expect(await response.json()).toEqual({
             success: true,
-            message: { status: 'ok' },
+            message: { status: 'ok', state: 'AWAITING_CONFIG' },
         })
     })
 })
