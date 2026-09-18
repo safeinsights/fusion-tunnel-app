@@ -126,6 +126,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private heartbeat: NodeJS.Timeout | null = null
     private pingEnabled = true
     private port = 0
+    private ackDrops: Partial<Record<RelayRole, number>> = {}
 
     constructor(readonly options: FakeRelayOptions) {
         super()
@@ -179,6 +180,19 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
 
     setPingEnabled(enabled: boolean): void {
         this.pingEnabled = enabled
+    }
+
+    /** Swallow the next `count` ACK frames sent by `role` (simulates a lost end-to-end ACK). */
+    dropNextAcks(role: RelayRole, count = 1): void {
+        this.ackDrops[role] = (this.ackDrops[role] ?? 0) + count
+    }
+
+    /** Push an arbitrary frame to a live socket as if the relay had originated it. */
+    injectFrame(relaySessionId: string, role: RelayRole, frame: Frame): boolean {
+        const conn = this.sessions.get(relaySessionId)?.sockets[role]
+        if (!conn || conn.ws.readyState !== WebSocket.OPEN) return false
+        this.sendFrame(conn.ws, frame)
+        return true
     }
 
     session(relaySessionId: string): Session | undefined {
@@ -371,6 +385,10 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
             case 'DATA':
                 return this.onData(session, role, frame.header, frame.payload)
             case 'ACK':
+                if ((this.ackDrops[role] ?? 0) > 0) {
+                    this.ackDrops[role]!--
+                    return
+                }
                 return this.onAck(session, role, frame.header.messageId)
             case 'NACK_DISCARD':
                 return this.onNack(session, role, frame.header.messageId)
@@ -403,6 +421,16 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
                 this.emit('backpressure', session.relaySessionId, direction, header.messageId)
                 return this.sendError(conn.ws, { code: 'BACKPRESSURE', retryable: true, messageId: header.messageId })
             }
+        }
+        // Idempotent append: a tunnel re-offers un-ACKed chunks after a reconnect (it cannot know
+        // which ones reached us); a chunk already held for (messageId, chunkIndex) is ignored.
+        if (
+            session.mailbox[direction].some(
+                (i) => i.messageId === header.messageId && i.chunkIndex === header.chunkIndex,
+            )
+        ) {
+            this.pushReady(session, peerOf(sender))
+            return
         }
         const item: MailboxItem = {
             seq: session.nextSeq[direction]++,

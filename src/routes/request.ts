@@ -3,6 +3,7 @@ import { apiError } from '@/http/errors'
 import { parseJsonBody } from '@/http/validate'
 import type { RouteHandler } from '@/http/router'
 import { InFlightConflictError } from '@/lib/exchange'
+import { BackpressureError } from '@/reliability/delivery'
 import { RequestBodySchema } from '@/schemas/local-api'
 import { guardLocalApi } from '@/routes/guard'
 import type { Tunnel } from '@/tunnel'
@@ -21,6 +22,9 @@ export const request =
         } catch (error) {
             if (error instanceof InFlightConflictError) {
                 return apiError(409, 'CONFLICT', error.message, { correlationId: error.correlationId })
+            }
+            if (error instanceof BackpressureError) {
+                return apiError(429, 'BACKPRESSURE', error.message, {}, { 'retry-after': '1' })
             }
             throw error
         }

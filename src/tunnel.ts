@@ -3,11 +3,13 @@ import type { ServerConfig } from '@/config'
 import { createHttpServer } from '@/http/server'
 import type { Router } from '@/http/router'
 import { canonicalJson } from '@/lib/canonical'
+import { Channel, type ChannelDeps, type VerifiedPeer } from '@/lib/channel'
 import { createIdentity, type Identity } from '@/lib/identity'
 import { Exchange, nullTransport, type ExchangeTransport } from '@/lib/exchange'
 import { Lifecycle, TERMINAL_STATES } from '@/lib/lifecycle'
 import { LongPoll } from '@/lib/long-poll'
 import { log } from '@/lib/logger'
+import { CapsMeter } from '@/reliability/caps'
 import type { DeliveredMessage } from '@/schemas/local-api'
 import type { ConfigurationBundle } from '@/schemas/provisioning'
 import { health } from '@/routes/health'
@@ -25,14 +27,17 @@ export type ConfigureResult = 'configured' | 'unchanged' | 'conflict' | 'termina
 
 export type TunnelDeps = {
     identity?: Identity
+    /** Replaces the channel's delivery as the exchange transport (unit tests). */
     transport?: ExchangeTransport
     now?: () => Date
+    channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider'>
 }
 
 /**
  * One tunnel instance: identity, lifecycle, the configuration bundle once provisioned, the
- * plaintext exchange, the long-poll registries and the HTTP server that exposes all of it.
- * Nothing is module-level, so a process can host several instances (in-process harness).
+ * plaintext exchange, the channel (relay + Noise + delivery), the long-poll registries and the
+ * HTTP server that exposes all of it. Nothing is module-level, so a process can host several
+ * instances (in-process harness).
  */
 export type Tunnel = {
     readonly config: ServerConfig
@@ -44,9 +49,14 @@ export type Tunnel = {
     readonly queryWaiters: LongPoll<DeliveredMessage>
     readonly bundle: ConfigurationBundle | undefined
     readonly exchange: Exchange | undefined
+    readonly channel: Channel | undefined
+    readonly caps: CapsMeter | undefined
     configure(bundle: ConfigurationBundle): ConfigureResult
     setTransport(transport: ExchangeTransport): void
+    /** The peer's key passed verification: attach to the relay (first time) or re-handshake. */
+    verifiedPeer(peer: VerifiedPeer): void
     complete(reason: string): void
+    stop(): void
 }
 
 export const registerRoutes = (router: Router, tunnel: Tunnel): void => {
@@ -71,6 +81,8 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
     let transport: ExchangeTransport = deps.transport ?? nullTransport
     let bundle: ConfigurationBundle | undefined
     let exchange: Exchange | undefined
+    let channel: Channel | undefined
+    let caps: CapsMeter | undefined
 
     lifecycle.onTransition((transition) => {
         log.info('lifecycle.transition', {
@@ -104,6 +116,12 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
         get exchange() {
             return exchange
         },
+        get channel() {
+            return channel
+        },
+        get caps() {
+            return caps
+        },
         // Assigned below once the HTTP server exists.
         router: undefined as unknown as Router,
         server: undefined as unknown as http.Server,
@@ -111,7 +129,27 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             if (lifecycle.isTerminal()) return 'terminal'
             if (bundle) return canonicalJson(bundle) === canonicalJson(next) ? 'unchanged' : 'conflict'
             bundle = next
-            exchange = new Exchange(next.role, { transport, onDelivered, now })
+            exchange = new Exchange(next.role, { onDelivered, now })
+            // Only the source meters caps: the party whose data is at risk enforces (§7.3).
+            caps =
+                next.role === 'source' ? new CapsMeter(next.caps, next.capsConsumed, () => now().getTime()) : undefined
+            channel = new Channel({
+                bundle: next,
+                identity,
+                tuning: config.tuning,
+                exchange,
+                lifecycle,
+                caps,
+                now: () => now().getTime(),
+                ...deps.channelDeps,
+            })
+            channel.on('control', (control, messageId, reason) => {
+                if (control === 'CLOSE' && lifecycle.state === 'CHANNEL_UP') {
+                    lifecycle.transition('CLOSING', `peer CLOSE received (${messageId}${reason ? `: ${reason}` : ''})`)
+                }
+            })
+            exchange.setTransport(deps.transport ?? channel.delivery)
+            transport = deps.transport ?? channel.delivery
             lifecycle.transition('CONFIGURED', 'configuration bundle accepted')
             log.info('tunnel.configured', {
                 studyId: next.studyId,
@@ -128,10 +166,25 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             transport = next
             exchange?.setTransport(next)
         },
+        verifiedPeer(peer) {
+            if (!channel) throw new Error('tunnel is not configured')
+            if (lifecycle.state === 'CONFIGURED') {
+                channel.setPeer(peer)
+                lifecycle.transition('PEER_KEY_VERIFIED', `peer key verified (generation ${peer.generation})`)
+                channel.attach()
+                return
+            }
+            // Re-verification after PEER_REJOINED (or a refreshed key): arm a new handshake.
+            channel.setPeer(peer)
+        },
         complete(reason) {
             lifecycle.transition('CLOSING', reason)
         },
+        stop() {
+            channel?.stop()
+        },
     }
+    void transport
 
     const app = createHttpServer((router) => registerRoutes(router, tunnel))
     Object.assign(tunnel, { router: app.router, server: app.server })

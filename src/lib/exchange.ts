@@ -126,8 +126,9 @@ export class Exchange {
         }
         const cid = correlationId ?? uuidv4()
         const messageId = uuidv4()
-        this.outstanding = { correlationId: cid, messageId }
+        // send first: a refused send (backpressure) leaves no half-recorded round behind
         this.transport.send({ kind: 'query', messageId, correlationId: cid, payload })
+        this.outstanding = { correlationId: cid, messageId }
         return { correlationId: cid, reissued: false }
     }
 
@@ -166,10 +167,16 @@ export class Exchange {
         if (!round) throw new UnknownCorrelationError(inReplyTo)
         if (round.responseMessageId) return { messageId: round.responseMessageId, replayed: true }
         const messageId = uuidv4()
+        // send first: a refused send (caps, backpressure) must not mark the round answered
+        this.transport.send({ kind: 'response', messageId, correlationId: inReplyTo, payload })
         round.responseMessageId = messageId
         round.responsePayload = payload
-        this.transport.send({ kind: 'response', messageId, correlationId: inReplyTo, payload })
         return { messageId, replayed: false }
+    }
+
+    /** The most recent query messageId for a round — what a response cites as `respondsTo`. */
+    latestQueryMessageId(correlationId: string): string | undefined {
+        return this.rounds.get(correlationId)?.queryMessageId
     }
 
     // ---- inbound from the channel --------------------------------------------------------
@@ -202,6 +209,7 @@ export class Exchange {
         if (round) {
             // The destination re-issued a round we already know (fresh messageId, same correlationId).
             // Stage two for the new query id is ours to complete; the RC never sees it twice.
+            round.queryMessageId = query.messageId
             this.transport.ack(query.messageId)
             if (round.responseMessageId !== undefined && round.responsePayload !== undefined) {
                 // Cached-response replay (v2 §7.3): a new frame, same correlation, no RC involvement.
@@ -254,6 +262,11 @@ export class Exchange {
         }
         this.transport.ack(messageId)
         return 'acked'
+    }
+
+    /** True once the RC has acknowledged this message (stage two complete). */
+    isConsumed(messageId: string): boolean {
+        return this.seen.has(messageId) && !this.pending.has(messageId)
     }
 
     // ---- observability (content-free) ----------------------------------------------------

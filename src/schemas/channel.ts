@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { BudgetSchema, JsonValueSchema } from '@/schemas/local-api'
 
 // Byte layouts of the end-to-end channel — WIRE CONTRACTS, frozen at v1 (plan Phase 3). Both
 // tunnels must produce identical bytes; any change is a protocol version bump.
@@ -59,3 +60,42 @@ export const REPLAY_WINDOW = 1024
 
 /** Epoch tag = first 8 bytes of the Noise handshake hash, hex — identifies one set of session keys. */
 export const EPOCH_TAG_BYTES = 8
+
+// ---- channel message (the plaintext inside the AEAD) ------------------------------------------
+
+/**
+ * What one logical message decrypts to, as canonical UTF-8 JSON. `correlationId` lives here,
+ * inside the ciphertext, never in relay-visible metadata. Control messages ride the same path so
+ * they are authenticated end to end: LIMIT_EXCEEDED (source → destination, caps breach) and CLOSE
+ * (destination → source, v2 §7.6). `budget` is the source's content-free consumption hint.
+ */
+export const CHANNEL_MESSAGE_VERSION = 1
+
+export const ChannelMessageSchema = z.discriminatedUnion('kind', [
+    z.object({
+        v: z.literal(CHANNEL_MESSAGE_VERSION),
+        kind: z.literal('query'),
+        correlationId: z.uuid(),
+        payload: JsonValueSchema,
+    }),
+    z.object({
+        v: z.literal(CHANNEL_MESSAGE_VERSION),
+        kind: z.literal('response'),
+        correlationId: z.uuid(),
+        payload: JsonValueSchema,
+        budget: BudgetSchema.optional(),
+    }),
+    z.object({
+        v: z.literal(CHANNEL_MESSAGE_VERSION),
+        kind: z.literal('control'),
+        control: z.enum(['CLOSE', 'LIMIT_EXCEEDED']),
+        reason: z.string().max(256).optional(),
+        budget: BudgetSchema.optional(),
+    }),
+])
+export type ChannelMessage = z.infer<typeof ChannelMessageSchema>
+
+/** Padding: each chunk plaintext is `u32BE dataLen ‖ data ‖ zero fill` up to `bucket − TRANSPORT_FRAME_OVERHEAD`. */
+export const PAD_LENGTH_BYTES = 4
+/** Smallest sensible padding bucket (frame size): room for the counter, tag, length prefix and some data. */
+export const MIN_PAD_BUCKET = 64

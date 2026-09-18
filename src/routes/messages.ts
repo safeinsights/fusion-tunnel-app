@@ -1,8 +1,9 @@
 import { json } from '@/http/json'
-import { apiError } from '@/http/errors'
+import { apiError, terminal } from '@/http/errors'
 import { parseJsonBody } from '@/http/validate'
 import type { RouteHandler } from '@/http/router'
 import { UnknownCorrelationError } from '@/lib/exchange'
+import { BackpressureError, LimitExceededError } from '@/reliability/delivery'
 import { PostMessageBodySchema } from '@/schemas/local-api'
 import { guardLocalApi } from '@/routes/guard'
 import type { Tunnel } from '@/tunnel'
@@ -25,6 +26,13 @@ export const messages =
         } catch (error) {
             if (error instanceof UnknownCorrelationError) {
                 return apiError(409, 'CONFLICT', error.message, { correlationId: error.correlationId })
+            }
+            if (error instanceof BackpressureError) {
+                return apiError(429, 'BACKPRESSURE', error.message, {}, { 'retry-after': '1' })
+            }
+            if (error instanceof LimitExceededError) {
+                // The tunnel has already told the destination and entered the terminal state.
+                return terminal('LIMIT_EXCEEDED', 410, error.message)
             }
             throw error
         }

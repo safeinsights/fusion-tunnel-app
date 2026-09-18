@@ -6,6 +6,8 @@
 
 /** Maximum ciphertext bytes per chunk. Fixed by the spec (v2 §7.2), deliberately not tunable. */
 export const CHUNK_CIPHERTEXT_MAX_BYTES = 32 * 1024
+/** Smallest padding bucket (a transport frame size) — mirrors schemas/channel.ts MIN_PAD_BUCKET. */
+export const MIN_PAD_BUCKET = 64
 
 export class ConfigError extends Error {
     constructor(message: string) {
@@ -17,7 +19,7 @@ export class ConfigError extends Error {
 export type Tuning = {
     /** Plaintext size above which a message travels via the relay blob store (§7.2). */
     inlineCapBytes: number
-    /** Ascending plaintext-frame padding buckets in bytes (§7.2, §9). */
+    /** Ascending padding buckets in bytes, measured as transport-frame (wire) sizes (§7.2, §9). */
     padBuckets: number[]
     /** Local in-flight window defaults; the relay's ADMITTED frame advertises the authoritative limits. */
     inflightMaxMsgs: number
@@ -40,6 +42,13 @@ export type Tuning = {
     peerKeyPollMs: number
     /** Bound on the CLOSE sequence before the tunnel gives up waiting for acks (§7.6). */
     closeTimeoutMs: number
+    /** Initiator resends handshake message 1 at this cadence until message 2 arrives. */
+    handshakeRetryMs: number
+    handshakeMaxAttempts: number
+    /** Delay before re-offering a message the relay answered with BACKPRESSURE. */
+    backpressureRetryMs: number
+    /** Bound on bytes held in partially reassembled inbound messages. */
+    inboxMaxPartialBytes: number
 }
 
 // PROVISIONAL — §15.6, tune during load testing
@@ -58,6 +67,10 @@ export const TUNING_DEFAULTS: Readonly<Tuning> = Object.freeze({
     statusIntervalMs: 60_000,
     peerKeyPollMs: 5_000,
     closeTimeoutMs: 30_000,
+    handshakeRetryMs: 2_000,
+    handshakeMaxAttempts: 300,
+    backpressureRetryMs: 500,
+    inboxMaxPartialBytes: 64 * 1024 * 1024,
 })
 
 export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze({
@@ -75,6 +88,10 @@ export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze(
     statusIntervalMs: 'FUSION_STATUS_INTERVAL_MS',
     peerKeyPollMs: 'FUSION_PEERKEY_POLL_MS',
     closeTimeoutMs: 'FUSION_CLOSE_TIMEOUT_MS',
+    handshakeRetryMs: 'FUSION_HANDSHAKE_RETRY_MS',
+    handshakeMaxAttempts: 'FUSION_HANDSHAKE_MAX_ATTEMPTS',
+    backpressureRetryMs: 'FUSION_BACKPRESSURE_RETRY_MS',
+    inboxMaxPartialBytes: 'FUSION_INBOX_MAX_BYTES',
 })
 
 type Env = Record<string, string | undefined>
@@ -105,6 +122,9 @@ const envBuckets = (env: Env, name: string, fallback: number[]): number[] => {
             throw new ConfigError(`${name} must be strictly ascending, got "${raw}"`)
         }
     }
+    if (buckets[0] < MIN_PAD_BUCKET) {
+        throw new ConfigError(`${name} buckets must be >= ${MIN_PAD_BUCKET} bytes, got "${raw}"`)
+    }
     if (buckets[buckets.length - 1] > CHUNK_CIPHERTEXT_MAX_BYTES) {
         throw new ConfigError(`${name} buckets must not exceed ${CHUNK_CIPHERTEXT_MAX_BYTES} bytes, got "${raw}"`)
     }
@@ -127,6 +147,18 @@ export const loadTuning = (env: Env = process.env): Tuning => {
         statusIntervalMs: envPositiveInt(env, TUNING_ENV.statusIntervalMs, TUNING_DEFAULTS.statusIntervalMs),
         peerKeyPollMs: envPositiveInt(env, TUNING_ENV.peerKeyPollMs, TUNING_DEFAULTS.peerKeyPollMs),
         closeTimeoutMs: envPositiveInt(env, TUNING_ENV.closeTimeoutMs, TUNING_DEFAULTS.closeTimeoutMs),
+        handshakeRetryMs: envPositiveInt(env, TUNING_ENV.handshakeRetryMs, TUNING_DEFAULTS.handshakeRetryMs),
+        handshakeMaxAttempts: envPositiveInt(
+            env,
+            TUNING_ENV.handshakeMaxAttempts,
+            TUNING_DEFAULTS.handshakeMaxAttempts,
+        ),
+        backpressureRetryMs: envPositiveInt(env, TUNING_ENV.backpressureRetryMs, TUNING_DEFAULTS.backpressureRetryMs),
+        inboxMaxPartialBytes: envPositiveInt(
+            env,
+            TUNING_ENV.inboxMaxPartialBytes,
+            TUNING_DEFAULTS.inboxMaxPartialBytes,
+        ),
     }
     if (tuning.reconnectMaxMs < tuning.reconnectMinMs) {
         throw new ConfigError(`${TUNING_ENV.reconnectMaxMs} must be >= ${TUNING_ENV.reconnectMinMs}`)
