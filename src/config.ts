@@ -49,6 +49,9 @@ export type Tuning = {
     backpressureRetryMs: number
     /** Bound on bytes held in partially reassembled inbound messages. */
     inboxMaxPartialBytes: number
+    /** Blob store PUT/GET retry cadence and attempt bound (v2 §7.2). */
+    blobRetryMs: number
+    blobMaxAttempts: number
 }
 
 // PROVISIONAL — §15.6, tune during load testing
@@ -71,6 +74,8 @@ export const TUNING_DEFAULTS: Readonly<Tuning> = Object.freeze({
     handshakeMaxAttempts: 300,
     backpressureRetryMs: 500,
     inboxMaxPartialBytes: 64 * 1024 * 1024,
+    blobRetryMs: 500,
+    blobMaxAttempts: 8,
 })
 
 export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze({
@@ -92,6 +97,8 @@ export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze(
     handshakeMaxAttempts: 'FUSION_HANDSHAKE_MAX_ATTEMPTS',
     backpressureRetryMs: 'FUSION_BACKPRESSURE_RETRY_MS',
     inboxMaxPartialBytes: 'FUSION_INBOX_MAX_BYTES',
+    blobRetryMs: 'FUSION_BLOB_RETRY_MS',
+    blobMaxAttempts: 'FUSION_BLOB_MAX_ATTEMPTS',
 })
 
 type Env = Record<string, string | undefined>
@@ -159,6 +166,8 @@ export const loadTuning = (env: Env = process.env): Tuning => {
             TUNING_ENV.inboxMaxPartialBytes,
             TUNING_DEFAULTS.inboxMaxPartialBytes,
         ),
+        blobRetryMs: envPositiveInt(env, TUNING_ENV.blobRetryMs, TUNING_DEFAULTS.blobRetryMs),
+        blobMaxAttempts: envPositiveInt(env, TUNING_ENV.blobMaxAttempts, TUNING_DEFAULTS.blobMaxAttempts),
     }
     if (tuning.reconnectMaxMs < tuning.reconnectMinMs) {
         throw new ConfigError(`${TUNING_ENV.reconnectMaxMs} must be >= ${TUNING_ENV.reconnectMinMs}`)

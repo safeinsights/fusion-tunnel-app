@@ -7,6 +7,7 @@ import { log, errorFields } from '@/lib/logger'
 import { encodePrologue, prologueInputsFor } from '@/lib/noise/prologue'
 import { HandshakeFailedError, NoiseSession, PeerIdentityMismatchError } from '@/lib/noise/session'
 import { RelayClient, type RelayClientOptions } from '@/lib/relay/client'
+import { BlobClient } from '@/lib/relay/blob-client'
 import type { CapsMeter } from '@/reliability/caps'
 import { Delivery, LimitExceededError, type ControlKind, type DeliveryEvent } from '@/reliability/delivery'
 import type { ConfigurationBundle } from '@/schemas/provisioning'
@@ -46,6 +47,9 @@ export type ChannelDeps = {
     caps?: CapsMeter
     tokenProvider?: () => Promise<string> | string
     relayFactory?: (options: RelayClientOptions) => RelayClient
+    /** Blob client override (tests); `null` disables the blob path so everything travels inline. */
+    blobClient?: BlobClient | null
+    fetch?: typeof fetch
     now?: () => number
 }
 
@@ -78,6 +82,17 @@ export class Channel extends EventEmitter<ChannelEvents> {
             },
         }
         this.relay = deps.relayFactory ? deps.relayFactory(options) : new RelayClient(options)
+        const blobs =
+            deps.blobClient === null
+                ? undefined
+                : (deps.blobClient ??
+                  new BlobClient({
+                      relayEndpoint: bundle.relay.endpoint,
+                      tokenProvider: options.tokenProvider,
+                      retryMs: tuning.blobRetryMs,
+                      maxAttempts: tuning.blobMaxAttempts,
+                      fetch: deps.fetch,
+                  }))
         this.delivery = new Delivery({
             role: bundle.role,
             connectionId: identity.connectionId,
@@ -93,8 +108,11 @@ export class Channel extends EventEmitter<ChannelEvents> {
                 },
             },
             caps: deps.caps,
+            blobs,
+            inlineCapBytes: tuning.inlineCapBytes,
             onControl: (control, messageId, reason) => this.onControl(control, messageId, reason),
             onLimitExceeded: (error) => this.onLimitExceeded(error),
+            onFatal: (reason) => this.deps.lifecycle.fail('ERRORED', reason),
             onEvent: (event) => this.emit('delivery', event),
             now: deps.now,
         })
@@ -105,7 +123,11 @@ export class Channel extends EventEmitter<ChannelEvents> {
             if (this.deps.lifecycle.state === 'PEER_KEY_VERIFIED') {
                 this.deps.lifecycle.transition('RELAY_ATTACHED', 'relay admitted')
             }
-            this.delivery.onReconnected({ maxMsgs: header.limits.windowMsgs, maxBytes: header.limits.windowBytes })
+            this.delivery.onReconnected({
+                maxMsgs: header.limits.windowMsgs,
+                maxBytes: header.limits.windowBytes,
+                inlineCapBytes: header.limits.inlineCapBytes,
+            })
             this.emit('attached')
             // Destination: send message 1. Source: arm a responder. A same-epoch reconnect keeps its session.
             if (this.peer && !this.session?.complete) this.startHandshake()

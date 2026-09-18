@@ -99,3 +99,34 @@ export type ChannelMessage = z.infer<typeof ChannelMessageSchema>
 export const PAD_LENGTH_BYTES = 4
 /** Smallest sensible padding bucket (frame size): room for the counter, tag, length prefix and some data. */
 export const MIN_PAD_BUCKET = 64
+
+// ---- blob path (v2 §7.2) ----------------------------------------------------------------------
+
+/**
+ * Above the inline cap a message travels as a ciphertext blob in the relay blob store and a small
+ * pointer through the channel. The blob plaintext is the full query/response channel message; the
+ * blob is sealed under a fresh ChaCha20-Poly1305 content key as `nonce(12) ‖ ciphertext ‖ tag(16)`
+ * with the blobId as associated data. The pointer — itself inside the Noise channel — carries the
+ * content key, so "wrapping" is the channel encryption. Blobs survive epoch changes; the pointer is
+ * what gets re-encrypted and re-sent.
+ */
+export const BLOB_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
+export const BLOB_NONCE_BYTES = 12
+export const BLOB_KEY_BYTES = 32
+
+export const BlobPointerSchema = z.object({
+    v: z.literal(CHANNEL_MESSAGE_VERSION),
+    kind: z.literal('blob-pointer'),
+    blobId: z.string().regex(BLOB_ID_PATTERN),
+    /** base64url, 32 bytes. */
+    contentKey: z.base64url(),
+    /** Ciphertext bytes stored at the relay (nonce ‖ body ‖ tag). */
+    size: z.int().positive(),
+    /** base64url SHA-256 of the blob plaintext (the inner channel message). */
+    sha256: z.base64url(),
+})
+export type BlobPointer = z.infer<typeof BlobPointerSchema>
+
+/** Everything that may arrive through the channel: a message, a control, or a pointer to a blob. */
+export const ChannelEnvelopeSchema = z.union([ChannelMessageSchema, BlobPointerSchema])
+export type ChannelEnvelope = z.infer<typeof ChannelEnvelopeSchema>

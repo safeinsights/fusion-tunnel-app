@@ -8,7 +8,15 @@ import { declaredSizeFor, splitMessage } from '@/reliability/chunker'
 import { Inbox } from '@/reliability/inbox'
 import { Outbox } from '@/reliability/outbox'
 import { pad, PaddingError, unpad } from '@/reliability/padding'
-import { ChannelMessageSchema, CHANNEL_MESSAGE_VERSION, type ChannelMessage } from '@/schemas/channel'
+import { openBlob, sealBlob, BlobContentError } from '@/reliability/blob-content'
+import type { BlobClient } from '@/lib/relay/blob-client'
+import {
+    ChannelEnvelopeSchema,
+    ChannelMessageSchema,
+    CHANNEL_MESSAGE_VERSION,
+    type BlobPointer,
+    type ChannelMessage,
+} from '@/schemas/channel'
 import type { Budget, Role } from '@/schemas/local-api'
 import type { DataHeader, Frame, NackDiscardHeader } from '@/schemas/relay-wire'
 
@@ -55,6 +63,9 @@ export type DeliveryEvent =
     | { type: 'peer_nack'; messageId: string; reason: string }
     | { type: 'control'; control: ControlKind; messageId: string }
     | { type: 'limit_exceeded'; side: 'query' | 'response'; limit: CapLimit }
+    | { type: 'blob_uploaded'; messageId: string; blobId: string; bytes: number; reupload: boolean }
+    | { type: 'blob_fetched'; messageId: string; blobId: string; bytes: number }
+    | { type: 'blob_failed'; messageId: string; blobId: string; phase: 'put' | 'get'; status: number }
 
 export type DeliveryOptions = {
     role: Role
@@ -66,8 +77,14 @@ export type DeliveryOptions = {
     exchange: Exchange
     sender: FrameSender
     caps?: CapsMeter
+    /** Blob store client; without one every message travels inline. */
+    blobs?: BlobClient
+    /** Plaintext size above which a message takes the blob path (adopted from ADMITTED when advertised). */
+    inlineCapBytes?: number
     onControl: (control: ControlKind, messageId: string, reason?: string) => void
     onLimitExceeded: (error: LimitExceededError) => void
+    /** A message can never be delivered (blob store refused it for good): the session cannot continue. */
+    onFatal?: (reason: string) => void
     onEvent?: (event: DeliveryEvent) => void
     now?: () => number
 }
@@ -80,11 +97,18 @@ export class Delivery implements ExchangeTransport {
     private readonly pendingAcks = new Set<string>()
     private retryTimer: NodeJS.Timeout | null = null
     private readonly now: () => number
+    private inlineCapBytes: number
+    /** Pointer messageIds whose blob is being fetched; a redelivered pointer must not fetch twice. */
+    private readonly resolvingBlobs = new Set<string>()
+    private stopped = false
 
     constructor(private readonly options: DeliveryOptions) {
         this.now = options.now ?? Date.now
         this.outbox = new Outbox(options.window, this.now)
         this.inbox = new Inbox(options.inbox, this.now)
+        this.inlineCapBytes = options.blobs
+            ? (options.inlineCapBytes ?? Number.POSITIVE_INFINITY)
+            : Number.POSITIVE_INFINITY
     }
 
     // ---- session lifecycle ---------------------------------------------------------------
@@ -98,9 +122,12 @@ export class Delivery implements ExchangeTransport {
         if (session) this.flush()
     }
 
-    /** The relay re-admitted us: re-offer un-ACKed sends (the relay appends idempotently) and pending ACKs. */
-    onReconnected(limits?: { maxMsgs: number; maxBytes: number }): void {
-        if (limits) this.outbox.setLimits(limits)
+    /** The relay re-admitted us: adopt its limits, re-offer un-ACKed sends (it appends idempotently) and pending ACKs. */
+    onReconnected(limits?: { maxMsgs: number; maxBytes: number; inlineCapBytes?: number }): void {
+        if (limits) {
+            this.outbox.setLimits({ maxMsgs: limits.maxMsgs, maxBytes: limits.maxBytes })
+            if (limits.inlineCapBytes !== undefined && this.options.blobs) this.inlineCapBytes = limits.inlineCapBytes
+        }
         this.outbox.invalidateSent()
         this.flush()
     }
@@ -110,6 +137,7 @@ export class Delivery implements ExchangeTransport {
     }
 
     stop(): void {
+        this.stopped = true
         if (this.retryTimer) clearTimeout(this.retryTimer)
         this.retryTimer = null
     }
@@ -178,11 +206,112 @@ export class Delivery implements ExchangeTransport {
         respondsTo?: string,
     ): void {
         const plaintext = Buffer.from(JSON.stringify(channelMessage), 'utf8')
+        if (plaintext.byteLength > this.inlineCapBytes && kind !== 'control' && this.options.blobs) {
+            return this.enqueueBlob(messageId, kind, plaintext, correlationId, respondsTo)
+        }
         const sizeBytes = declaredSizeFor(plaintext.byteLength, this.options.buckets)
-        if (!this.outbox.add({ messageId, kind, correlationId, plaintext, sizeBytes, respondsTo })) {
+        if (
+            !this.outbox.add({
+                messageId,
+                kind,
+                correlationId,
+                plaintext,
+                sizeBytes,
+                wireSizeBytes: sizeBytes,
+                respondsTo,
+            })
+        ) {
             throw new BackpressureError()
         }
         this.flush()
+    }
+
+    /**
+     * Blob path (v2 §7.2): seal the whole channel message under a fresh content key, keep the sealed
+     * blob in the outbox until ACK (so a purged blob can be re-uploaded), send the pointer through the
+     * mailbox once the upload lands. Local window accounting counts the blob; the relay's counts the pointer.
+     */
+    private enqueueBlob(
+        messageId: string,
+        kind: OutboundMessage['kind'],
+        plaintext: Buffer,
+        correlationId?: string,
+        respondsTo?: string,
+    ): void {
+        const blobId = uuidv4()
+        const sealed = sealBlob(plaintext, blobId)
+        const pointer: BlobPointer = {
+            v: CHANNEL_MESSAGE_VERSION,
+            kind: 'blob-pointer',
+            blobId,
+            contentKey: sealed.contentKey.toString('base64url'),
+            size: sealed.ciphertext.byteLength,
+            sha256: sealed.sha256.toString('base64url'),
+        }
+        const pointerBytes = Buffer.from(JSON.stringify(pointer), 'utf8')
+        const wireSizeBytes = declaredSizeFor(pointerBytes.byteLength, this.options.buckets)
+        const added = this.outbox.add({
+            messageId,
+            kind,
+            correlationId,
+            plaintext: pointerBytes,
+            sizeBytes: wireSizeBytes + sealed.ciphertext.byteLength,
+            wireSizeBytes,
+            respondsTo,
+            blob: { blobId, ciphertext: sealed.ciphertext, uploaded: false, uploading: false, attempts: 0 },
+        })
+        if (!added) throw new BackpressureError()
+        log.info('channel.blob_path', {
+            messageId,
+            blobId,
+            plaintextBytes: plaintext.byteLength,
+            blobBytes: sealed.ciphertext.byteLength,
+        })
+        void this.uploadBlob(messageId)
+    }
+
+    private async uploadBlob(messageId: string): Promise<void> {
+        const entry = this.outbox.get(messageId)
+        const blobs = this.options.blobs
+        if (!entry?.blob || !blobs || entry.blob.uploading || entry.blob.uploaded || this.stopped) return
+        entry.blob.uploading = true
+        entry.blob.attempts++
+        const reupload = entry.blob.attempts > 1
+        const result = await blobs.put(entry.blob.blobId, entry.blob.ciphertext)
+        entry.blob.uploading = false
+        if (this.stopped || !this.outbox.has(messageId)) return
+        if (result.ok) {
+            entry.blob.uploaded = true
+            this.emit({
+                type: 'blob_uploaded',
+                messageId,
+                blobId: entry.blob.blobId,
+                bytes: result.sizeBytes,
+                reupload,
+            })
+            log.info('channel.blob_uploaded', {
+                messageId,
+                blobId: entry.blob.blobId,
+                bytes: result.sizeBytes,
+                reupload,
+            })
+            this.flush()
+            return
+        }
+        this.emit({ type: 'blob_failed', messageId, blobId: entry.blob.blobId, phase: 'put', status: result.status })
+        if (result.retryable) {
+            // The client already retried transient failures; re-offer later (e.g. after a reconnect).
+            log.warn('channel.blob_upload_deferred', { messageId, blobId: entry.blob.blobId, status: result.status })
+            this.scheduleRetry()
+            return
+        }
+        log.error('channel.blob_upload_rejected', {
+            messageId,
+            blobId: entry.blob.blobId,
+            status: result.status,
+            code: result.code,
+        })
+        this.options.onFatal?.(`blob upload rejected (${result.code ?? result.status})`)
     }
 
     // ---- outbound frames -----------------------------------------------------------------
@@ -197,6 +326,10 @@ export class Delivery implements ExchangeTransport {
             this.pendingAcks.delete(messageId)
         }
         for (const entry of this.outbox.pendingFor(epochTag)) {
+            if (entry.blob && !entry.blob.uploaded) {
+                if (!entry.blob.uploading) void this.uploadBlob(entry.messageId)
+                continue
+            }
             const chunks = splitMessage(entry.plaintext, this.options.buckets)
             const frames: Frame[] = chunks.map((chunk, chunkIndex) => {
                 const aad = encodeChunkHeader({
@@ -213,7 +346,7 @@ export class Delivery implements ExchangeTransport {
                         chunkCount: chunks.length,
                         epochTag,
                         ...(entry.respondsTo ? { respondsTo: entry.respondsTo } : {}),
-                        sizeBytes: entry.sizeBytes,
+                        sizeBytes: entry.wireSizeBytes,
                     },
                     payload: session.encrypt(pad(chunk, this.options.buckets), aad),
                 }
@@ -234,7 +367,8 @@ export class Delivery implements ExchangeTransport {
                 kind: entry.kind,
                 correlationId: entry.correlationId,
                 chunks: chunks.length,
-                sizeBytes: entry.sizeBytes,
+                sizeBytes: entry.wireSizeBytes,
+                blob: entry.blob !== undefined,
                 epochTag,
                 resend,
             })
@@ -276,7 +410,15 @@ export class Delivery implements ExchangeTransport {
         this.emit({ type: 'peer_nack', messageId: header.messageId, reason: header.reason })
         log.warn('channel.peer_nack', { messageId: header.messageId, reason: header.reason })
         const entry = this.outbox.get(header.messageId)
-        if (entry && entry.sends < 3) {
+        if (!entry) return
+        if (entry.blob && header.reason === 'blob_missing') {
+            // The relay no longer holds the blob (purged or lost): upload it again, then re-send the pointer.
+            entry.blob.uploaded = false
+            this.outbox.resetSent(header.messageId)
+            void this.uploadBlob(header.messageId)
+            return
+        }
+        if (entry.sends < 3) {
             this.outbox.resetSent(header.messageId)
             this.scheduleRetry()
         }
@@ -329,15 +471,66 @@ export class Delivery implements ExchangeTransport {
     }
 
     private onMessage(messageId: string, plaintext: Buffer): void {
-        let parsed: ChannelMessage
+        let envelope: ChannelMessage | BlobPointer
         try {
-            const result = ChannelMessageSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
+            const result = ChannelEnvelopeSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
             if (!result.success) return this.nack(messageId, 'malformed')
-            parsed = result.data
+            envelope = result.data
         } catch {
             return this.nack(messageId, 'malformed')
         }
+        if (envelope.kind === 'blob-pointer') {
+            if (this.resolvingBlobs.has(messageId)) return
+            void this.resolveBlob(messageId, envelope)
+            return
+        }
+        this.onChannelMessage(messageId, envelope)
+    }
 
+    /** Receiver side of the blob path: GET, open under the pointer's key, then treat as an inline message. */
+    private async resolveBlob(messageId: string, pointer: BlobPointer): Promise<void> {
+        const blobs = this.options.blobs
+        if (!blobs) return this.nack(messageId, 'malformed')
+        this.resolvingBlobs.add(messageId)
+        try {
+            const result = await blobs.get(pointer.blobId)
+            if (this.stopped) return
+            if (!result.ok) {
+                this.emit({
+                    type: 'blob_failed',
+                    messageId,
+                    blobId: pointer.blobId,
+                    phase: 'get',
+                    status: result.status,
+                })
+                return this.nack(messageId, result.notFound ? 'blob_missing' : 'blob_unavailable')
+            }
+            if (result.bytes.byteLength !== pointer.size) return this.nack(messageId, 'malformed')
+            let inner: Buffer
+            try {
+                inner = openBlob(
+                    result.bytes,
+                    Buffer.from(pointer.contentKey, 'base64url'),
+                    pointer.blobId,
+                    Buffer.from(pointer.sha256, 'base64url'),
+                )
+            } catch (error) {
+                if (error instanceof BlobContentError) return this.nack(messageId, 'undecryptable')
+                throw error
+            }
+            const parsed = ChannelMessageSchema.safeParse(JSON.parse(inner.toString('utf8')))
+            if (!parsed.success || parsed.data.kind === 'control') return this.nack(messageId, 'malformed')
+            this.emit({ type: 'blob_fetched', messageId, blobId: pointer.blobId, bytes: result.bytes.byteLength })
+            log.info('channel.blob_fetched', { messageId, blobId: pointer.blobId, bytes: result.bytes.byteLength })
+            this.onChannelMessage(messageId, parsed.data)
+        } catch {
+            this.nack(messageId, 'malformed')
+        } finally {
+            this.resolvingBlobs.delete(messageId)
+        }
+    }
+
+    private onChannelMessage(messageId: string, parsed: ChannelMessage): void {
         if (parsed.kind === 'control') {
             this.ack(messageId)
             this.emit({ type: 'control', control: parsed.control, messageId })

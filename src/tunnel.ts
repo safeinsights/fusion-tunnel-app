@@ -31,7 +31,7 @@ export type TunnelDeps = {
     /** Replaces the channel's delivery as the exchange transport (unit tests). */
     transport?: ExchangeTransport
     now?: () => Date
-    channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider'>
+    channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider' | 'blobClient' | 'fetch'>
     /** `null` disables the BMA client (harnesses that play the directory themselves). */
     bma?: null | { fetch?: typeof fetch }
 }

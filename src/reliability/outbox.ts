@@ -12,8 +12,22 @@ export type OutboxEntry = {
     correlationId?: string
     /** Canonical channel-message bytes; what gets padded, chunked and sealed on every (re)send. */
     plaintext: Buffer
-    /** Declared wire size the message reserves in the relay window (sum of its frame sizes). */
+    /**
+     * Bytes this entry occupies in the local window bound. For inline messages this equals the wire
+     * size; for blob messages it also counts the sealed blob kept for re-upload.
+     */
     sizeBytes: number
+    /** Declared wire size of the frames sent through the mailbox (the pointer, for a blob message). */
+    wireSizeBytes: number
+    /** Present for messages travelling by the blob path (v2 §7.2). */
+    blob?: {
+        blobId: string
+        /** Sealed blob kept until ACK so a purged blob can be re-uploaded. */
+        ciphertext: Buffer
+        uploaded: boolean
+        uploading: boolean
+        attempts: number
+    }
     /** Plaintext messageId of the query a response answers (relay retention rule). */
     respondsTo?: string
     /** Epoch tag the entry was last fully sent under; undefined means it needs (re)sending. */

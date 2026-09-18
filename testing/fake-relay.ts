@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { randomBytes } from 'node:crypto'
+import { BLOB_ID_PATTERN } from '@/schemas/channel'
 import jwt from 'jsonwebtoken'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
@@ -86,6 +87,8 @@ export type FakeRelayOptions = {
     tokenMaxAgeS?: number
     tokenGraceS?: number
     path?: string
+    maxBlobBytes?: number
+    sessionBlobQuotaBytes?: number
 }
 
 export const DEFAULT_LIMITS: RelayLimits = {
@@ -113,6 +116,10 @@ export interface FakeRelayEvents {
     deadLetter: [relaySessionId: string, messageId: string]
     close: [relaySessionId: string, phase: 'requested' | 'acked' | 'purged' | 'timeout']
     handshakeDropped: [relaySessionId: string, toRole: RelayRole]
+    blobPut: [relaySessionId: string, blobId: string, bytes: number]
+    blobGet: [relaySessionId: string, blobId: string, found: boolean]
+    blobRejected: [status: number, code: string]
+    blobsPurged: [relaySessionId: string, count: number]
 }
 
 const directionFor = (senderRole: RelayRole): Direction => (senderRole === 'destination' ? 'dstToSrc' : 'srcToDst')
@@ -130,6 +137,9 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private pingEnabled = true
     private port = 0
     private ackDrops: Partial<Record<RelayRole, number>> = {}
+    /** Blob store: relaySessionId → blobId → ciphertext bytes (opaque). */
+    readonly blobStore = new Map<string, Map<string, Buffer>>()
+    private blobFailures: Record<'put' | 'get', number> = { put: 0, get: 0 }
 
     constructor(readonly options: FakeRelayOptions) {
         super()
@@ -192,6 +202,20 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         this.ackDrops[role] = (this.ackDrops[role] ?? 0) + count
     }
 
+    /** Fail the next `count` blob requests of a kind with 503. */
+    failNextBlob(kind: 'put' | 'get', count = 1): void {
+        this.blobFailures[kind] += count
+    }
+
+    blobs(relaySessionId: string): string[] {
+        return [...(this.blobStore.get(relaySessionId)?.keys() ?? [])]
+    }
+
+    /** Drop one blob behind the tunnel's back (a lost or prematurely expired object). */
+    deleteBlob(relaySessionId: string, blobId: string): boolean {
+        return this.blobStore.get(relaySessionId)?.delete(blobId) ?? false
+    }
+
     /** Push an arbitrary frame to a live socket as if the relay had originated it. */
     injectFrame(relaySessionId: string, role: RelayRole, frame: Frame): boolean {
         const conn = this.sessions.get(relaySessionId)?.sockets[role]
@@ -217,13 +241,95 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     // ---- HTTP (blob store lands in Phase 7) -------------------------------------------------------
 
     private handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
-        if (req.url === '/api/health') {
-            res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ success: true }))
+        const url = new URL(req.url ?? '/', 'http://relay')
+        if (url.pathname === '/api/health') return this.jsonResponse(res, 200, { success: true })
+        const blob = /^\/api\/blobs\/([^/]+)$/.exec(url.pathname)
+        if (blob && (req.method === 'PUT' || req.method === 'GET')) {
+            void this.handleBlob(req, res, decodeURIComponent(blob[1]), req.method)
             return
         }
-        res.writeHead(404, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ error: 'not found' }))
+        this.jsonResponse(res, 404, { error: 'not found' })
+    }
+
+    /**
+     * Blob store routes as the relay implements them: relay token as Bearer (no PoP on this path),
+     * keys scoped by the token's relaySessionId, 401/400/410/413/429 on refusal, 201 with
+     * `{blobId, sizeBytes}` on PUT, octet-stream or 404 on GET. Bytes are opaque.
+     */
+    private async handleBlob(
+        req: http.IncomingMessage,
+        res: http.ServerResponse,
+        blobId: string,
+        method: 'PUT' | 'GET',
+    ): Promise<void> {
+        const kind = method === 'PUT' ? 'put' : 'get'
+        if (this.blobFailures[kind] > 0) {
+            this.blobFailures[kind]--
+            return this.blobError(res, 503, 'RATE_LIMITED', true)
+        }
+        const token = req.headers.authorization?.match(/^Bearer\s+(\S+)$/i)?.[1]
+        if (!token) return this.blobError(res, 401, 'AUTH_TOKEN_INVALID', false)
+        let claims: RelayTokenClaims
+        try {
+            const decoded = jwt.verify(token, this.options.bmaPublicKeyPem, {
+                algorithms: ['RS256'],
+                audience: RELAY_TOKEN_AUDIENCE,
+                clockTolerance: this.options.tokenGraceS ?? 60,
+            })
+            const parsed = RelayTokenClaimsSchema.safeParse(decoded)
+            if (!parsed.success) return this.blobError(res, 401, 'AUTH_TOKEN_INVALID', false)
+            claims = parsed.data
+        } catch (error) {
+            const expired = error instanceof jwt.TokenExpiredError
+            return this.blobError(res, 401, expired ? 'AUTH_TOKEN_EXPIRED' : 'AUTH_TOKEN_INVALID', expired)
+        }
+        if (!BLOB_ID_PATTERN.test(blobId)) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
+        const session = this.sessions.get(claims.relaySessionId)
+        if (method === 'PUT') {
+            if (!session) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
+            if (session.status === 'closed' || session.status === 'errored')
+                return this.blobError(res, 410, 'SESSION_CLOSED', false)
+            const chunks: Buffer[] = []
+            for await (const chunk of req) chunks.push(chunk as Buffer)
+            const bytes = Buffer.concat(chunks)
+            if (bytes.byteLength === 0) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
+            const maxBlob = this.options.maxBlobBytes ?? 256 * 1024 * 1024
+            if (bytes.byteLength > maxBlob) return this.blobError(res, 413, 'BLOB_TOO_LARGE', false)
+            const store = this.blobStore.get(session.relaySessionId) ?? new Map<string, Buffer>()
+            const used = [...store.values()].reduce((sum, b) => sum + b.byteLength, 0)
+            if (used + bytes.byteLength > (this.options.sessionBlobQuotaBytes ?? 5 * 1024 * 1024 * 1024)) {
+                return this.blobError(res, 429, 'QUOTA_EXCEEDED', false, 'session')
+            }
+            store.set(blobId, bytes)
+            this.blobStore.set(session.relaySessionId, store)
+            this.emit('blobPut', session.relaySessionId, blobId, bytes.byteLength)
+            return this.jsonResponse(res, 201, { blobId, sizeBytes: bytes.byteLength })
+        }
+        const bytes = this.blobStore.get(claims.relaySessionId)?.get(blobId)
+        this.emit('blobGet', claims.relaySessionId, blobId, bytes !== undefined)
+        if (!bytes) return this.jsonResponse(res, 404, { error: 'Not found' })
+        res.writeHead(200, {
+            'content-type': 'application/octet-stream',
+            'content-length': String(bytes.byteLength),
+            'cache-control': 'no-store',
+        })
+        res.end(bytes)
+    }
+
+    private blobError(
+        res: http.ServerResponse,
+        status: number,
+        code: RelayErrorCode,
+        retryable: boolean,
+        scope?: 'session' | 'study',
+    ): void {
+        this.emit('blobRejected', status, code)
+        this.jsonResponse(res, status, { error: { code, retryable, ...(scope ? { scope } : {}) } })
+    }
+
+    private jsonResponse(res: http.ServerResponse, status: number, body: unknown): void {
+        res.writeHead(status, { 'content-type': 'application/json' })
+        res.end(JSON.stringify(body))
     }
 
     // ---- admission --------------------------------------------------------------------------------
@@ -597,9 +703,12 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         this.emit('close', session.relaySessionId, 'purged')
     }
 
-    /** Purge mailboxes, notify live sockets, and close them. */
+    /** Purge mailboxes and blobs, notify live sockets, and close them. */
     private endSession(session: Session, error: ErrorHeader): void {
         session.mailbox = { dstToSrc: [], srcToDst: [] }
+        const purged = this.blobStore.get(session.relaySessionId)?.size ?? 0
+        this.blobStore.delete(session.relaySessionId)
+        if (purged) this.emit('blobsPurged', session.relaySessionId, purged)
         for (const role of ['source', 'destination'] as const) {
             const conn = session.sockets[role]
             if (!conn) continue

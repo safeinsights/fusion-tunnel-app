@@ -7,6 +7,7 @@ const entry = (messageId: string, sizeBytes = 100) => ({
     correlationId: 'c',
     plaintext: Buffer.from('x'),
     sizeBytes,
+    wireSizeBytes: sizeBytes,
 })
 
 describe('Outbox', () => {
