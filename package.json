@@ -1,0 +1,49 @@
+{
+    "name": "fusion-tunnel-app",
+    "version": "0.0.1",
+    "description": "SafeInsights Fusion Tunnel App",
+    "packageManager": "pnpm@11.1.3",
+    "engines": {
+        "node": ">=22",
+        "pnpm": ">=11"
+    },
+    "scripts": {
+        "dev": "tsx watch src/server.ts",
+        "build": "esbuild src/server.ts --bundle --platform=node --target=node22 --format=cjs --external:sodium-native --outfile=dist/server.js",
+        "start": "node dist/server.js",
+        "docker:build": "docker build --platform=linux/amd64 -t fusion-tunnel-app .",
+        "lint": "eslint . && prettier --check .",
+        "lint:fix": "eslint --fix . && prettier --write .",
+        "typecheck": "tsc --noEmit",
+        "pre:push": "pnpm run lint:fix && pnpm run checks",
+        "pre:commit": "pnpm exec lint-staged",
+        "checks": "pnpm run typecheck && pnpm run lint",
+        "test": "vitest"
+    },
+    "license": "AGPL-3.0-or-later",
+    "devDependencies": {
+        "@eslint/js": "^10.0.1",
+        "@types/jsonwebtoken": "^9.0.10",
+        "@types/node": "^26.1.0",
+        "@types/ws": "^8.18.1",
+        "@vitest/coverage-v8": "*",
+        "esbuild": "^0.28.1",
+        "eslint": "^9",
+        "eslint-config-prettier": "*",
+        "eslint-plugin-anti-trojan-source": "^1.1.4",
+        "husky": "^9.1.7",
+        "lint-staged": "^17.0.5",
+        "prettier": "*",
+        "tsx": "^4.23.0",
+        "typescript": "^5.9.3",
+        "typescript-eslint": "^8.62.1",
+        "vitest": "*"
+    },
+    "dependencies": {
+        "jsonwebtoken": "^9.0.3",
+        "noise-handshake": "^4.2.0",
+        "uuid": "^13.0.0",
+        "ws": "^8.21.3",
+        "zod": "^4.6.5"
+    }
+}

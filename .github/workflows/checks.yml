@@ -1,0 +1,65 @@
+name: Checks
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    all:
+        timeout-minutes: 60
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - uses: pnpm/action-setup@v6
+            - uses: actions/setup-node@v6
+              with:
+                  node-version: lts/*
+                  cache: 'pnpm'
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+            - name: Lint
+              run: pnpm run lint
+            - name: Run Trivy vulnerability scanner in fs mode
+              uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+              with:
+                  scan-type: 'fs'
+                  scan-ref: '.'
+                  trivy-config: trivy.yaml
+            - name: Run Trivy license scanner
+              uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+              with:
+                  scan-type: 'fs'
+                  scan-ref: '.'
+                  scanners: 'license'
+                  severity: 'HIGH,CRITICAL'
+                  exit-code: '1'
+            - name: Run SonarQube SAST Scan
+              uses: SonarSource/sonarqube-scan-action@v6
+              env:
+                  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+                  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+            - name: Typecheck
+              run: pnpm run typecheck
+            - name: Unit Test
+              run: pnpm run test
+            - name: Test build
+              run: pnpm run build
+            - name: Build container image
+              run: docker build --target runtime -t fusion-tunnel-app:ci .
+            # The tunnel writes nothing to disk (memory-only outbox, no temp files); the image must
+            # come up and answer /health with a read-only root filesystem and no writable mounts.
+            - name: Read-only root filesystem smoke test
+              run: |
+                  cid=$(docker run -d --read-only -p 3003:3003 fusion-tunnel-app:ci)
+                  ok=0
+                  for _ in $(seq 1 30); do
+                      if curl -fsS http://localhost:3003/health; then ok=1; break; fi
+                      sleep 1
+                  done
+                  echo
+                  docker logs "$cid"
+                  docker rm -f "$cid" >/dev/null
+                  test "$ok" = 1

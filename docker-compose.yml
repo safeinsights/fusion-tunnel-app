@@ -1,0 +1,19 @@
+# Local stub — Phase 9 adds the two-party and hub profiles with the fake relay, fake BMA and
+# scripted research containers. Every tunnel container runs read-only with no volumes: the tunnel
+# must write nothing to disk (mandatory at the hub, persistence policy none).
+services:
+    tunnel:
+        container_name: fusion-tunnel
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+        read_only: true
+        environment:
+            PORT: 3003
+        ports:
+            - 3003:3003
+        networks:
+            - fusion-job
+networks:
+    fusion-job:
