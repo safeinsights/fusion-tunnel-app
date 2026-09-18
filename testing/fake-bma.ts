@@ -288,6 +288,16 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
                     return this.postLaunched(res, auth, body)
                 case 'GET /api/health':
                     return this.json(res, 200, { success: true })
+                case 'GET /api/public-key':
+                    // harness only: lets a containerized fake relay learn the BMA verification key
+                    return this.json(res, 200, { pem: this.key.publicPem })
+                case 'POST /api/orgs': {
+                    // harness only: a containerized fake Setup App registers its freshly generated org key
+                    const b = body as { slug?: string; pem?: string }
+                    if (!b?.slug || !b.pem) return this.json(res, 400, { error: 'slug and pem required' })
+                    this.registerOrg(b.slug, b.pem)
+                    return this.json(res, 201, { slug: b.slug })
+                }
                 default:
                     return this.json(res, 404, { error: 'not found' })
             }

@@ -98,6 +98,7 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
             if (frame.type === 'DATA' && frame.header.seq !== undefined) this.lastSeqReceived = frame.header.seq
         })
         this.deps.lifecycle.onTransition((transition) => {
+            if (transition.to === 'CHANNEL_UP') this.stopPeerKeyPoll()
             if (this.deps.lifecycle.isTerminal()) {
                 this.clearTimers()
                 void this.report('terminal', { code: this.deps.lifecycle.terminalCode()!, reason: transition.reason })
@@ -140,6 +141,12 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         void this.pollPeerKey()
     }
 
+    private stopPeerKeyPoll(): void {
+        if (this.peerKeyTimer) clearTimeout(this.peerKeyTimer)
+        this.peerKeyTimer = null
+        this.polling = false
+    }
+
     private async pollPeerKey(): Promise<void> {
         if (this.stopped) return
         try {
@@ -157,19 +164,22 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
                     if (verdict.ok) {
                         this.lastSeenGeneration = verdict.peer.generation
                         this.peerGeneration = verdict.peer.generation
-                        this.requireNewer = false
                         this.peerKeyRejected = false
-                        this.polling = false
                         log.info('bma.peer_key_verified', {
                             legId: this.deps.bundle.legId,
                             generation: verdict.peer.generation,
                         })
                         this.emit('peerKeyVerified', verdict.peer)
                         this.deps.verifiedPeer(verdict.peer)
-                        return
-                    }
-                    // A stale generation right after PEER_REJOINED just means the peer has not published yet.
-                    if (!(verdict.reason === 'stale_generation' && this.requireNewer)) {
+                        // Keep watching for a strictly newer key until the channel is up: a peer re-provisioned
+                        // before it ever attached publishes a new generation without any PEER_REJOINED reaching us.
+                        this.requireNewer = true
+                        if (this.deps.lifecycle.state === 'CHANNEL_UP') {
+                            this.polling = false
+                            return
+                        }
+                    } else if (!(verdict.reason === 'stale_generation' && this.requireNewer)) {
+                        // A stale generation while waiting for a newer key just means the peer has not published yet.
                         this.rejectPeerKey(verdict.reason, `generation ${parsed.data.generation}`)
                     }
                 }
@@ -181,7 +191,7 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
             this.emit('requestFailed', 'peer-key', error)
             log.warn('bma.peer_key_fetch_failed', errorFields(error))
         }
-        if (this.stopped) return
+        if (this.stopped || !this.polling) return
         this.peerKeyTimer = setTimeout(() => void this.pollPeerKey(), this.deps.tuning.peerKeyPollMs)
         this.peerKeyTimer.unref()
     }

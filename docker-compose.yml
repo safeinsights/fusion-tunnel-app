@@ -1,19 +1,185 @@
-# Local stub — Phase 9 adds the two-party and hub profiles with the fake relay, fake BMA and
-# scripted research containers. Every tunnel container runs read-only with no volumes: the tunnel
-# must write nothing to disk (mandatory at the hub, persistence policy none).
+# Local end-to-end stacks for the tunnel (plan Phase 9). Two profiles:
+#
+#   docker compose --profile two-party run --rm rc-dst     one leg: source dp-a → destination si-hub
+#   docker compose --profile hub run --rm rc-dst           hub: two legs (dp-a, dp-b) into one destination enclave
+#
+# `run` starts every dependency, waits for the fake Setup App to finish provisioning, and exits with
+# the destination RC's code (0 = all rounds completed and both legs closed). The fake relay and fake
+# BMA are the in-repo doubles; one fake Setup App container provisions every tunnel (in production
+# each enclave has its own). Every tunnel container is `read_only` with no volumes — the tunnel
+# writes nothing to disk, which is mandatory at the hub (persistence policy none).
+#
+# Networks mirror the Docker backend: a `core` network for the relay and BMA, and one bridge network
+# per enclave joining exactly that enclave's tunnel(s) and research container. Tunnels sit on their
+# enclave network and on `core` (their only egress: relay + BMA).
+
+x-tunnel: &tunnel
+    build:
+        context: .
+        target: runtime
+    read_only: true
+    environment:
+        PORT: 3003
+        FUSION_LONGPOLL_MS: 5000
+        FUSION_PEERKEY_POLL_MS: 1000
+        FUSION_HANDSHAKE_RETRY_MS: 1000
+        FUSION_STATUS_INTERVAL_MS: 15000
+    healthcheck:
+        test: ['CMD', 'curl', '-f', 'http://localhost:3003/health']
+        interval: 5s
+        timeout: 3s
+        retries: 20
+
+x-harness: &harness
+    build:
+        context: .
+        target: dev
+
 services:
-    tunnel:
-        container_name: fusion-tunnel
-        build:
-            context: .
-            dockerfile: Dockerfile
-            target: runtime
-        read_only: true
+    fake-bma:
+        <<: *harness
+        profiles: [two-party, hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/fake-bma.ts']
         environment:
-            PORT: 3003
-        ports:
-            - 3003:3003
-        networks:
-            - fusion-job
+            PORT: 4500
+            RELAY_WS_URL: ws://fake-relay:4400/ws
+        networks: [core]
+        healthcheck:
+            test: ['CMD', 'curl', '-f', 'http://localhost:4500/api/health']
+            interval: 3s
+            timeout: 3s
+            retries: 30
+
+    fake-relay:
+        <<: *harness
+        profiles: [two-party, hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/fake-relay.ts']
+        environment:
+            PORT: 4400
+            BMA_URL: http://fake-bma:4500
+        depends_on:
+            fake-bma:
+                condition: service_healthy
+        networks: [core]
+        healthcheck:
+            test: ['CMD', 'curl', '-f', 'http://localhost:4400/api/health']
+            interval: 3s
+            timeout: 3s
+            retries: 30
+
+    # ---- enclave A (Data Partner A, source) ----------------------------------------------
+    tunnel-src-a:
+        <<: *tunnel
+        profiles: [two-party, hub]
+        networks: [core, enclave-a]
+
+    rc-src-a:
+        <<: *harness
+        profiles: [two-party, hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/rc.ts']
+        environment:
+            FUSION_ROLE: source
+            FUSION_TUNNEL_ENDPOINT: http://tunnel-src-a:3003
+            FUSION_TUNNEL_TOKEN: compose-token-src-a-0123456789
+            RC_MARKER: A
+        depends_on:
+            setup:
+                condition: service_completed_successfully
+        networks: [enclave-a]
+
+    # ---- enclave B (Data Partner B, source; hub profile only) ------------------------------
+    tunnel-src-b:
+        <<: *tunnel
+        profiles: [hub]
+        networks: [core, enclave-b]
+
+    rc-src-b:
+        <<: *harness
+        profiles: [hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/rc.ts']
+        environment:
+            FUSION_ROLE: source
+            FUSION_TUNNEL_ENDPOINT: http://tunnel-src-b:3003
+            FUSION_TUNNEL_TOKEN: compose-token-src-b-0123456789
+            RC_MARKER: B
+        depends_on:
+            setup:
+                condition: service_completed_successfully
+        networks: [enclave-b]
+
+    # ---- destination enclave (one tunnel per leg) --------------------------------------------
+    tunnel-dst-a:
+        <<: *tunnel
+        profiles: [two-party, hub]
+        networks: [core, enclave-dst]
+
+    tunnel-dst-b:
+        <<: *tunnel
+        profiles: [hub]
+        networks: [core, enclave-dst]
+
+    rc-dst:
+        <<: *harness
+        profiles: [two-party]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/rc.ts']
+        environment:
+            FUSION_ROLE: destination
+            FUSION_TUNNEL_ENDPOINT: http://tunnel-dst-a:3003
+            FUSION_TUNNEL_TOKEN: compose-token-dst-a-0123456789
+            RC_ROUNDS: 4
+        depends_on:
+            setup:
+                condition: service_completed_successfully
+            rc-src-a:
+                condition: service_started
+        networks: [enclave-dst]
+
+    rc-dst-hub:
+        <<: *harness
+        profiles: [hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/rc.ts']
+        environment:
+            FUSION_ROLE: destination
+            FUSION_TUNNEL_ENDPOINTS: '{"a":"http://tunnel-dst-a:3003","b":"http://tunnel-dst-b:3003"}'
+            FUSION_TUNNEL_TOKENS: '{"a":"compose-token-dst-a-0123456789","b":"compose-token-dst-b-0123456789"}'
+            RC_ROUNDS: 6
+        depends_on:
+            setup:
+                condition: service_completed_successfully
+            rc-src-a:
+                condition: service_started
+            rc-src-b:
+                condition: service_started
+        networks: [enclave-dst]
+
+    # ---- the (single, harness) Setup App: provisions every tunnel over its local API -------
+    setup:
+        <<: *harness
+        profiles: [two-party, hub]
+        command: ['pnpm', 'exec', 'tsx', 'testing/bin/setup.ts']
+        environment:
+            BMA_URL: http://fake-bma:4500
+            STUDY_ID: study-compose
+            # two-party: one leg. The hub profile overrides SETUP_LEGS via compose.hub.yml or the env below.
+            SETUP_LEGS: >-
+                [{"legId":"leg-a","sourceOrg":"dp-a","destinationOrg":"si-hub",
+                  "sourceTunnelUrl":"http://tunnel-src-a:3003","destinationTunnelUrl":"http://tunnel-dst-a:3003",
+                  "sourceToken":"compose-token-src-a-0123456789","destinationToken":"compose-token-dst-a-0123456789",
+                  "caps":{"maxRounds":100}}
+                 ${HUB_LEG_B:-}]
+        depends_on:
+            fake-bma:
+                condition: service_healthy
+            fake-relay:
+                condition: service_healthy
+            tunnel-src-a:
+                condition: service_healthy
+            tunnel-dst-a:
+                condition: service_healthy
+        networks: [core, enclave-a, enclave-b, enclave-dst]
+
 networks:
-    fusion-job:
+    core:
+    enclave-a:
+    enclave-b:
+    enclave-dst:

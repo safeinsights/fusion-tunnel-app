@@ -63,3 +63,22 @@ jobs:
                   docker logs "$cid"
                   docker rm -f "$cid" >/dev/null
                   test "$ok" = 1
+
+    # The compose stacks are the regression bed the real relay and BMA are later swapped into.
+    # Kept as a separate job so unit CI stays fast; `run` returns the destination RC's exit code.
+    compose-smoke:
+        needs: all
+        timeout-minutes: 25
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v6
+            - name: Two-party stack
+              run: docker compose --profile two-party run --build --rm rc-dst
+            - name: Tear down
+              if: always()
+              run: docker compose --profile two-party down -v --remove-orphans
+            - name: Hub stack
+              run: docker compose --env-file compose.hub.env --profile hub run --build --rm rc-dst-hub
+            - name: Tear down hub
+              if: always()
+              run: docker compose --env-file compose.hub.env --profile hub down -v --remove-orphans

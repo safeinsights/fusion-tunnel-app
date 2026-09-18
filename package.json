@@ -18,7 +18,13 @@
         "pre:push": "pnpm run lint:fix && pnpm run checks",
         "pre:commit": "pnpm exec lint-staged",
         "checks": "pnpm run typecheck && pnpm run lint",
-        "test": "vitest"
+        "test": "vitest",
+        "harness:relay": "tsx testing/bin/fake-relay.ts",
+        "harness:bma": "tsx testing/bin/fake-bma.ts",
+        "harness:setup": "tsx testing/bin/setup.ts",
+        "harness:rc": "tsx testing/bin/rc.ts",
+        "compose:two-party": "docker compose --profile two-party run --build --rm rc-dst",
+        "compose:hub": "docker compose --env-file compose.hub.env --profile hub run --build --rm rc-dst-hub"
     },
     "license": "AGPL-3.0-or-later",
     "devDependencies": {
