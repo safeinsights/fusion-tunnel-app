@@ -337,7 +337,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
             legId,
             expiresInS: ttl,
             key: this.key,
-            issuer: 'fake-bma',
         })
         const credential = caller === 'org' ? this.mintCredential({ studyId, jobId, legId, orgSlug, role }) : undefined
         if (credential) this.emit('credentialIssued', legId, role)

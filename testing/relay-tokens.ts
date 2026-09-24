@@ -1,9 +1,14 @@
 import { generateKeyPairSync, type KeyObject } from 'node:crypto'
 import jwt from 'jsonwebtoken'
-import { RELAY_TOKEN_AUDIENCE, type Role as RelayRole, type RelayTokenClaims } from '@/relay-protocol'
+import {
+    RELAY_TOKEN_AUDIENCE,
+    RELAY_TOKEN_ISSUER,
+    type Role as RelayRole,
+    type RelayTokenClaims,
+} from '@/relay-protocol'
 
 // The harness stands in for the BMA's relay-token issuance: an RSA keypair per test process,
-// RS256 tokens minted exactly to schemas/relay-wire.ts RelayTokenClaims, verified by the fake
+// RS256 tokens minted exactly to relay-protocol.ts RelayTokenClaims (issuer and audience included), verified by the fake
 // relay through the same public key a production relay would read from BMA_RELAY_PUBLIC_KEY_PEM.
 
 export type BmaKeypair = { publicKey: KeyObject; privateKey: KeyObject; publicPem: string }
@@ -37,7 +42,7 @@ export const mintRelayToken = (options: MintOptions): string => {
     const now = Math.floor(Date.now() / 1000)
     const claims: Record<string, unknown> = {
         aud: RELAY_TOKEN_AUDIENCE,
-        iss: options.issuer ?? 'fake-bma',
+        iss: options.issuer ?? RELAY_TOKEN_ISSUER,
         iat: now,
         exp: now + (options.expiresInS ?? 900),
         relaySessionId: options.relaySessionId,

@@ -9,6 +9,7 @@ import {
     newNonce,
     popPublicKeyFromRaw,
     RELAY_TOKEN_AUDIENCE,
+    RELAY_TOKEN_ISSUER,
     RelayTokenClaims,
     verifyPop,
     type ErrorHeader,
@@ -213,6 +214,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         try {
             decoded = jwt.verify(hello.token, this.options.bmaPublicKeyPem, {
                 algorithms: ['RS256'],
+                issuer: RELAY_TOKEN_ISSUER,
                 audience: RELAY_TOKEN_AUDIENCE,
                 maxAge: `${this.options.tokenMaxAgeS ?? 900}s`,
                 clockTolerance: this.options.tokenGraceS ?? 60,
