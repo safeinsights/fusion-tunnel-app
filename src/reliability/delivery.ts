@@ -379,12 +379,23 @@ export class Delivery implements ExchangeTransport {
     private onData(header: DataHeader, payload: Buffer): void {
         const session = this.session
         if (!session?.complete || !this.peerConnectionId) return this.nack(header.messageId, 'stale_epoch')
-        const aad = encodeChunkHeader({
-            messageId: header.messageId,
-            chunkIndex: header.chunkIndex,
-            chunkCount: header.chunkCount,
-            senderConnectionId: this.peerConnectionId,
-        })
+        // The wire schema only bounds the header's strings and numbers; the AAD layout needs a UUID
+        // messageId and a consistent chunk index/count. A relay-supplied header that fails those
+        // invariants is NACKed like any other malformed frame instead of throwing out of the socket
+        // listener and taking the process down.
+        let aad: Buffer
+        try {
+            aad = encodeChunkHeader({
+                messageId: header.messageId,
+                chunkIndex: header.chunkIndex,
+                chunkCount: header.chunkCount,
+                senderConnectionId: this.peerConnectionId,
+            })
+        } catch (error) {
+            if (error instanceof TypeError || error instanceof RangeError)
+                return this.nack(header.messageId, 'malformed')
+            throw error
+        }
         let padded: Buffer
         try {
             padded = session.decrypt(payload, aad)

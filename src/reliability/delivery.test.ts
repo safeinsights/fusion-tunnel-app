@@ -397,6 +397,30 @@ describe('Delivery back to back', () => {
         idle.destinationDelivery.stop()
     })
 
+    it('NACKs a DATA header the AAD layout cannot encode instead of throwing out of onFrame', () => {
+        const t = setup()
+        const notAUuid = 'relay-made-this-up'
+        expect(() =>
+            t.sourceDelivery.onFrame({
+                type: 'DATA',
+                header: { messageId: notAUuid, chunkIndex: 0, chunkCount: 1 },
+                payload: randomBytes(64),
+            }),
+        ).not.toThrow()
+        expect(t.events.source.at(-1)).toMatchObject({ type: 'nack', messageId: notAUuid, reason: 'malformed' })
+        const messageId = randomUUID()
+        expect(() =>
+            t.sourceDelivery.onFrame({
+                type: 'DATA',
+                header: { messageId, chunkIndex: 1, chunkCount: 1 },
+                payload: randomBytes(64),
+            }),
+        ).not.toThrow()
+        expect(t.events.source.at(-1)).toMatchObject({ type: 'nack', messageId, reason: 'malformed' })
+        t.sourceDelivery.stop()
+        t.destinationDelivery.stop()
+    })
+
     it('NACKs malformed plaintext and handles a peer NACK by re-offering', async () => {
         const t = setup()
         const messageId = randomUUID()

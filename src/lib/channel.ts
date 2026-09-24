@@ -292,18 +292,32 @@ export class Channel extends EventEmitter<ChannelEvents> {
     // ---- frames ----------------------------------------------------------------------------
 
     private onFrame(frame: Frame): void {
-        switch (frame.type) {
-            case 'HANDSHAKE':
-                return this.onHandshakeFrame(frame.payload)
-            case 'CLOSE':
-                return this.onCloseFrame(frame.payload)
-            case 'CLOSE_ACK':
-                // The peer acknowledged; the relay purges next and closes us with SESSION_CLOSED.
-                log.info('channel.close_acked', {})
-                this.emit('closeAcked')
-                return
-            default:
-                return this.delivery.onFrame(frame)
+        try {
+            switch (frame.type) {
+                case 'HANDSHAKE':
+                    return this.onHandshakeFrame(frame.payload)
+                case 'CLOSE':
+                    return this.onCloseFrame(frame.payload)
+                case 'CLOSE_ACK':
+                    // The peer acknowledged; the relay purges next and closes us with SESSION_CLOSED.
+                    log.info('channel.close_acked', {})
+                    this.emit('closeAcked')
+                    return
+                default:
+                    return this.delivery.onFrame(frame)
+            }
+        } catch (error) {
+            // Nothing above this point catches: an escape here would reach the socket's 'message'
+            // listener as an uncaught exception and exit 1 with no terminal report. A cap breach
+            // surfaced while answering an inbound frame (the source replaying a cached response to a
+            // re-issued query) has already moved the lifecycle to LIMIT_EXCEEDED through
+            // onLimitExceeded; anything else is a bug or a hostile frame and ends the leg as ERRORED.
+            if (error instanceof LimitExceededError) return
+            log.error('channel.frame_failed', { type: frame.type, ...errorFields(error) })
+            this.deps.lifecycle.fail(
+                'ERRORED',
+                `frame ${frame.type}: ${error instanceof Error ? error.message : String(error)}`,
+            )
         }
     }
 

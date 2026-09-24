@@ -278,6 +278,30 @@ describe('two tunnels through the fake relay', () => {
     )
 
     it(
+        'a relay-supplied DATA header the wire schema admits but the AAD cannot encode is NACKed, not fatal',
+        { timeout: T },
+        async () => {
+            pair = await startPair()
+            await pair.connect()
+            const events: DeliveryEvent[] = []
+            pair.source.tunnel.channel!.on('delivery', (e) => events.push(e))
+            const messageId = 'not-a-uuid'
+            expect(
+                pair.relay.injectFrame(pair.relaySessionId, 'source', {
+                    type: 'DATA',
+                    header: { messageId, chunkIndex: 0, chunkCount: 1 },
+                    payload: Buffer.alloc(64, 1),
+                }),
+            ).toBe(true)
+            await until(() => events.find((e) => e.type === 'nack'), 5000, 'nack')
+            expect(events.find((e) => e.type === 'nack')).toMatchObject({ messageId, reason: 'malformed' })
+            expect(pair.source.tunnel.lifecycle.state).toBe('CHANNEL_UP')
+            const round = await runRound(pair, { q: 'still up' }, () => ({ a: 'yes' }))
+            expect(round.response.payload).toEqual({ a: 'yes' })
+        },
+    )
+
+    it(
         'query-side cap breach terminates the leg loudly on both sides with no partial delivery',
         { timeout: T },
         async () => {
