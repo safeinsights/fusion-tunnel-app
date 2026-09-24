@@ -4,7 +4,6 @@
 
 type Partial = {
     chunkCount: number
-    epochTag: string
     chunks: Map<number, Buffer>
     bytes: number
     firstSeenAt: number
@@ -26,15 +25,15 @@ export class Inbox {
         private readonly now: () => number = Date.now,
     ) {}
 
-    accept(messageId: string, chunkIndex: number, chunkCount: number, epochTag: string, data: Buffer): InboxResult {
+    accept(messageId: string, chunkIndex: number, chunkCount: number, data: Buffer): InboxResult {
         if (chunkIndex >= chunkCount) return { status: 'inconsistent' }
         let partial = this.partials.get(messageId)
         if (!partial) {
             if (this.partials.size >= this.limits.maxPartialMessages) return { status: 'overflow' }
-            partial = { chunkCount, epochTag, chunks: new Map(), bytes: 0, firstSeenAt: this.now() }
+            partial = { chunkCount, chunks: new Map(), bytes: 0, firstSeenAt: this.now() }
             this.partials.set(messageId, partial)
         }
-        if (partial.chunkCount !== chunkCount || partial.epochTag !== epochTag) {
+        if (partial.chunkCount !== chunkCount) {
             this.drop(messageId)
             return { status: 'inconsistent' }
         }

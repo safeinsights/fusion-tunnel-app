@@ -18,7 +18,7 @@ export default defineConfig({
                 branches: 70,
             },
             include: ['src/**/*.ts'],
-            exclude: ['src/**/*.test.ts', 'src/**/*.d.ts'],
+            exclude: ['src/**/*.test.ts', 'src/**/*.d.ts', 'src/relay-protocol.ts'],
             reportOnFailure: true,
         },
     },

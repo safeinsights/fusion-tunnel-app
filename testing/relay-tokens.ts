@@ -1,6 +1,6 @@
 import { generateKeyPairSync, type KeyObject } from 'node:crypto'
 import jwt from 'jsonwebtoken'
-import { RELAY_TOKEN_AUDIENCE, type RelayRole, type RelayTokenClaims } from '@/schemas/relay-wire'
+import { RELAY_TOKEN_AUDIENCE, type Role as RelayRole, type RelayTokenClaims } from '@/relay-protocol'
 
 // The harness stands in for the BMA's relay-token issuance: an RSA keypair per test process,
 // RS256 tokens minted exactly to schemas/relay-wire.ts RelayTokenClaims, verified by the fake

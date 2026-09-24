@@ -1,6 +1,6 @@
 import { generateKeyPairSync, randomBytes, type KeyObject } from 'node:crypto'
 import { loadConfig } from '@/config'
-import { close, listen } from '@/http/server'
+import { close, listen } from '@/http'
 import type { ExchangeTransport, OutboundMessage } from '@/lib/exchange'
 import type { ConfigurationBundle } from '@/schemas/provisioning'
 import { createTunnel, type Tunnel, type TunnelDeps } from '@/tunnel'
@@ -40,6 +40,7 @@ export const makeBundle = (overrides: Partial<ConfigurationBundle> = {}): Config
 
 export class RecordingTransport implements ExchangeTransport {
     readonly sent: OutboundMessage[] = []
+    /** End-to-end ACKs this side sent (a message handed to its RC). */
     readonly acks: string[] = []
     /** Sent messageIds the peer has acknowledged end to end (tests populate this). */
     readonly ackedByPeer = new Set<string>()
@@ -96,6 +97,7 @@ export const api = (baseUrl: string, token?: string) => {
     return {
         get: (path: string) => call('GET', path),
         post: (path: string, body?: unknown) => call('POST', path, body),
+        del: (path: string) => call('DELETE', path),
         postRaw: (path: string, raw: string) => call('POST', path, undefined, raw),
     }
 }

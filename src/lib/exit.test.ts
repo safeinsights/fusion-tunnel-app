@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { installExitPolicy, exitCodeFor, EXIT_CODES } from './exit'
 import { loadConfig } from '@/config'
 import { createTunnel, type Tunnel } from '@/tunnel'
-import { listen } from '@/http/server'
+import { listen } from '@/http'
 import { makeBundle, driveToChannelUp } from '@/testing/fixtures'
 
 const start = async () => {

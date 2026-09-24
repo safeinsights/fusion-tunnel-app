@@ -1,5 +1,5 @@
 import { ConfigError, loadConfig, PROVISION_TOKEN_ENV } from '@/config'
-import { listen } from '@/http/server'
+import { listen } from '@/http'
 import { installExitPolicy } from '@/lib/exit'
 import { log, errorFields } from '@/lib/logger'
 import { createTunnel, type Tunnel } from '@/tunnel'

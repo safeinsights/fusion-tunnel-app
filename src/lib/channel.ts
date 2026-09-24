@@ -2,39 +2,37 @@ import { EventEmitter } from 'node:events'
 import type { Tuning } from '@/config'
 import type { Exchange } from '@/lib/exchange'
 import type { Identity } from '@/lib/identity'
-import type { Lifecycle } from '@/lib/lifecycle'
+import type { Lifecycle, TerminalDetail } from '@/lib/lifecycle'
 import { log, errorFields } from '@/lib/logger'
 import { encodePrologue, prologueInputsFor } from '@/lib/noise/prologue'
 import { HandshakeFailedError, NoiseSession, PeerIdentityMismatchError } from '@/lib/noise/session'
-import { RelayClient, type RelayClientOptions } from '@/lib/relay/client'
-import { BlobClient } from '@/lib/relay/blob-client'
+import { RelayClient, type RelayClientOptions } from '@/lib/relay-client'
+import type { VerifiedPeer } from '@/lib/bma/verify-peer-key'
+import type { TerminalCode } from '@/local-api'
 import type { CapsMeter } from '@/reliability/caps'
-import { Delivery, LimitExceededError, type ControlKind, type DeliveryEvent } from '@/reliability/delivery'
+import { Delivery, LimitExceededError, type DeliveryEvent, type VerifiedClose } from '@/reliability/delivery'
+import type { Frame, PeerHeader } from '@/relay-protocol'
 import type { ConfigurationBundle } from '@/schemas/provisioning'
-import type { Frame } from '@/schemas/relay-wire'
 
 // The channel orchestrator: one relay attachment, one Noise_IK session (per epoch) and one
 // Delivery, driven by the lifecycle machine. The peer's verified key arrives from the BMA client
-// (or the test harness) via setPeer(); the destination initiates the handshake and retries the
-// same message 1 until message 2 arrives; the source answers, and re-answers a byte-identical
-// message 1 so a lost message 2 converges without a new epoch. PEER_REJOINED tears the session
-// down and hands re-fetch + re-handshake back to the caller.
+// (or the test harness) via setPeer(); the relay's PEER frames say when the peer is attached and
+// with which fingerprint. A fingerprint we did not handshake with means the peer restarted: the
+// session is torn down and the caller re-fetches the key and re-handshakes. The destination
+// initiates and retries message 1 while the peer is attached; the source answers, and re-answers a
+// byte-identical message 1 so a lost message 2 converges without a new epoch.
 
-export type VerifiedPeer = {
-    publicKey: Buffer
-    connectionId: string
-    generation: number
-}
+export type { VerifiedPeer }
 
 export interface ChannelEvents {
     attached: []
     closeAcked: []
     closed: [reason: string]
     channelUp: [epochTag: string]
-    peerRejoined: [peerRole: 'source' | 'destination']
+    peerRejoined: [fingerprint: string]
     handshakeFailed: [reason: string]
     limitExceeded: [error: LimitExceededError]
-    control: [control: ControlKind, messageId: string, reason: string | undefined]
+    peerClose: [close: VerifiedClose]
     delivery: [event: DeliveryEvent]
     relayFatal: [reason: string]
     disconnected: []
@@ -49,9 +47,6 @@ export type ChannelDeps = {
     caps?: CapsMeter
     tokenProvider?: () => Promise<string> | string
     relayFactory?: (options: RelayClientOptions) => RelayClient
-    /** Blob client override (tests); `null` disables the blob path so everything travels inline. */
-    blobClient?: BlobClient | null
-    fetch?: typeof fetch
     now?: () => number
 }
 
@@ -67,9 +62,6 @@ export class Channel extends EventEmitter<ChannelEvents> {
     private closeTimer: NodeJS.Timeout | null = null
     private closing = false
     private stopped = false
-    /** The LIMIT_EXCEEDED notice we queued for the peer; CLOSE waits for its ACK (bounded). */
-    private limitNoticeId: string | undefined
-    private limitNoticeTimer: NodeJS.Timeout | null = null
 
     constructor(private readonly deps: ChannelDeps) {
         super()
@@ -81,64 +73,43 @@ export class Channel extends EventEmitter<ChannelEvents> {
             role: bundle.role,
             tokenProvider: deps.tokenProvider ?? (() => bundle.relay.token),
             signChallenge: (payload) => identity.signPop(payload),
-            tuning: {
-                heartbeatMs: tuning.heartbeatMs,
-                heartbeatMisses: tuning.heartbeatMisses,
-                reconnectMinMs: tuning.reconnectMinMs,
-                reconnectMaxMs: tuning.reconnectMaxMs,
-            },
+            tuning,
         }
         this.relay = deps.relayFactory ? deps.relayFactory(options) : new RelayClient(options)
-        const blobs =
-            deps.blobClient === null
-                ? undefined
-                : (deps.blobClient ??
-                  new BlobClient({
-                      relayEndpoint: bundle.relay.endpoint,
-                      tokenProvider: options.tokenProvider,
-                      retryMs: tuning.blobRetryMs,
-                      maxAttempts: tuning.blobMaxAttempts,
-                      fetch: deps.fetch,
-                  }))
+        const relay = this.relay
         this.delivery = new Delivery({
             role: bundle.role,
             connectionId: identity.connectionId,
-            buckets: tuning.padBuckets,
-            window: { maxMsgs: tuning.inflightMaxMsgs, maxBytes: tuning.inflightMaxBytes },
-            inbox: { maxPartialMessages: tuning.inflightMaxMsgs, maxPartialBytes: tuning.inboxMaxPartialBytes },
+            window: { maxMsgs: tuning.inflightMaxMsgs, maxBytes: tuning.outboxMaxBytes },
+            maxMessageBytes: tuning.maxMessageBytes,
+            inbox: { maxPartialMessages: tuning.inflightMaxMsgs, maxPartialBytes: tuning.inboxMaxBytes },
             backpressureRetryMs: tuning.backpressureRetryMs,
+            retransmitMs: tuning.retransmitMs,
+            maxSends: tuning.maxSends,
+            unackedMaxMs: tuning.unackedMaxMs,
             exchange: deps.exchange,
             sender: {
-                send: (frame) => this.relay.send(frame),
+                send: (frame) => relay.send(frame),
                 get connected() {
-                    return self.relay.admitted
+                    return relay.admitted
+                },
+                get peerAttached() {
+                    return relay.peerAttached
                 },
             },
             caps: deps.caps,
-            blobs,
-            inlineCapBytes: tuning.inlineCapBytes,
-            onControl: (control, messageId, reason) => this.onControl(control, messageId, reason),
             onLimitExceeded: (error) => this.onLimitExceeded(error),
             onFatal: (reason) => this.deps.lifecycle.fail('ERRORED', reason),
             onEvent: (event) => this.emit('delivery', event),
             now: deps.now,
         })
-        // eslint-disable-next-line @typescript-eslint/no-this-alias
-        const self = this
 
-        this.relay.on('admitted', (header) => {
-            if (this.deps.lifecycle.state === 'PEER_KEY_VERIFIED') {
+        this.relay.on('admitted', () => {
+            if (this.deps.lifecycle.state === 'PEER_KEY_VERIFIED')
                 this.deps.lifecycle.transition('RELAY_ATTACHED', 'relay admitted')
-            }
-            this.delivery.onReconnected({
-                maxMsgs: header.limits.windowMsgs,
-                maxBytes: header.limits.windowBytes,
-                inlineCapBytes: header.limits.inlineCapBytes,
-            })
             this.emit('attached')
-            // Destination: send message 1. Source: arm a responder. A same-epoch reconnect keeps its session.
-            if (this.peer && !this.session?.complete) this.startHandshake()
         })
+        this.relay.on('peer', (peer) => this.onPeer(peer))
         this.relay.on('frame', (frame) => this.onFrame(frame))
         this.relay.on('disconnected', () => this.emit('disconnected'))
         this.relay.on('fatal', (reason) => {
@@ -146,10 +117,10 @@ export class Channel extends EventEmitter<ChannelEvents> {
             if (reason === 'SESSION_CLOSED') return this.finishClosed('relay purged the session')
             this.deps.lifecycle.fail('ERRORED', `relay: ${reason}`)
         })
-        // A failed session tells the relay to purge (best effort); the relay's own fatal codes need no reply.
-        this.deps.lifecycle.onTransition((transition) => {
-            if (transition.to === 'ERRORED') this.sendCloseBestEffort(transition.reason)
-            else if (transition.to === 'LIMIT_EXCEEDED') this.sendCloseAfterLimitNotice(transition.reason)
+        // How we ended travels to the peer inside the authenticated CLOSE, whatever ended us.
+        this.deps.lifecycle.onTransition((t) => {
+            if (t.to === 'ERRORED') this.close('SESSION_ERRORED', t.reason)
+            else if (t.to === 'LIMIT_EXCEEDED') this.close('LIMIT_EXCEEDED', t.reason, t.detail)
         })
     }
 
@@ -174,14 +145,45 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.relay.start()
     }
 
-    /** The peer's pin-verified directory key. Also (re)starts the handshake when attached. */
+    /** The peer's pin-verified directory key. Also (re)starts the handshake when the peer is attached. */
     setPeer(peer: VerifiedPeer): void {
         this.peer = peer
         this.tearDownSession()
-        if (this.relay.admitted) this.startHandshake()
+        if (this.relay.peerAttached) this.startHandshake()
     }
 
-    /** Destination: send message 1 and retry it; source: arm a responder for message 1. */
+    stop(): void {
+        this.stopped = true
+        this.clearHandshakeTimer()
+        this.clearCloseTimer()
+        this.delivery.stop()
+        this.relay.stop()
+        this.tearDownSession()
+    }
+
+    // ---- peer presence -------------------------------------------------------------------
+
+    private onPeer(peer: PeerHeader): void {
+        if (!peer.attached) {
+            this.clearHandshakeTimer()
+            return
+        }
+        if (this.peer && peer.fingerprint && peer.fingerprint !== this.peer.fingerprint) {
+            // The peer restarted with new keys: everything we sealed for the old ones is void.
+            log.info('channel.peer_rejoined', { fingerprint: peer.fingerprint })
+            this.clearHandshakeTimer()
+            this.tearDownSession()
+            if (this.deps.lifecycle.state === 'CHANNEL_UP') {
+                this.deps.lifecycle.transition('RELAY_ATTACHED', 'peer rejoined with a new identity')
+            }
+            this.emit('peerRejoined', peer.fingerprint)
+            return
+        }
+        if (this.session?.complete) return this.delivery.reoffer()
+        if (this.peer) this.startHandshake()
+    }
+
+    /** Destination: send message 1 and retry it while the peer is attached; source: arm a responder. */
     startHandshake(): void {
         if (!this.peer || this.stopped) return
         this.clearHandshakeTimer()
@@ -202,68 +204,35 @@ export class Channel extends EventEmitter<ChannelEvents> {
         }
     }
 
-    stop(): void {
-        this.stopped = true
-        if (this.limitNoticeTimer) clearTimeout(this.limitNoticeTimer)
-        this.limitNoticeTimer = null
-        this.clearHandshakeTimer()
-        this.clearCloseTimer()
-        this.delivery.stop()
-        this.relay.stop()
-        this.tearDownSession()
+    private sendMsg1(): void {
+        if (!this.msg1 || this.stopped || !this.relay.peerAttached) return
+        this.handshakeAttempts++
+        if (this.handshakeAttempts > this.deps.tuning.handshakeMaxAttempts) {
+            log.error('channel.handshake_exhausted', { attempts: this.handshakeAttempts - 1 })
+            this.emit('handshakeFailed', 'max attempts')
+            return
+        }
+        const sent = this.relay.send({ type: 'HANDSHAKE', header: {}, payload: this.msg1 })
+        log.info('channel.handshake_sent', { attempt: this.handshakeAttempts, sent })
+        this.handshakeTimer = setTimeout(() => this.sendMsg1(), this.deps.tuning.handshakeRetryMs)
+        this.handshakeTimer.unref()
     }
 
     // ---- CLOSE (v2 §7.6) -----------------------------------------------------------------
 
     /**
-     * Destination: start the CLOSE sequence — an authenticated CLOSE to the peer through the relay,
-     * then wait for the peer's CLOSE_ACK / the relay's SESSION_CLOSED, bounded by the close timeout.
-     * The lifecycle is CLOSING from the caller's transition until finishClosed().
+     * Send an authenticated CLOSE carrying how this side ended (STUDY_COMPLETE from the RC's
+     * complete(), LIMIT_EXCEEDED from a cap breach, SESSION_ERRORED from a failure), then wait for
+     * the peer's CLOSE_ACK / the relay's SESSION_CLOSED, bounded by the close timeout. The caller
+     * moves the lifecycle; this only speaks to the peer.
      */
-    close(reason = 'rc requested completion'): void {
+    close(code: TerminalCode, reason = 'rc requested completion', limit?: TerminalDetail): void {
         if (this.closing || this.stopped) return
         this.closing = true
-        const payload = this.delivery.sealClose(reason) ?? Buffer.alloc(0)
+        const payload = this.delivery.sealClose(code, reason, limit) ?? Buffer.alloc(0)
         const sent = this.relay.send({ type: 'CLOSE', header: {}, payload })
-        log.info('channel.close_sent', { sent, authenticated: payload.byteLength > 0 })
-        this.armCloseTimer()
-    }
-
-    /**
-     * The LIMIT_EXCEEDED notice travels through the mailbox (a DATA frame the relay stores and pumps to
-     * the peer) while CLOSE is a control frame the relay forwards at once, so a CLOSE sent right away
-     * can overtake the notice and the destination would end CLOSED (STUDY_COMPLETE) instead of
-     * LIMIT_EXCEEDED. Wait for the notice's ACK, bounded by limitNoticeAckMs, before closing.
-     */
-    private sendCloseAfterLimitNotice(reason: string): void {
-        const noticeId = this.limitNoticeId
-        if (this.closing || !noticeId || !this.delivery.holds(noticeId)) return this.sendCloseBestEffort(reason)
-        const done = (): void => {
-            if (this.limitNoticeTimer) clearTimeout(this.limitNoticeTimer)
-            this.limitNoticeTimer = null
-            this.off('delivery', onDelivery)
-            this.sendCloseBestEffort(reason)
-        }
-        const onDelivery = (event: DeliveryEvent): void => {
-            if (event.type === 'acked' && event.messageId === noticeId) done()
-        }
-        this.on('delivery', onDelivery)
-        this.limitNoticeTimer = setTimeout(() => {
-            log.warn('channel.limit_notice_unacked', {
-                messageId: noticeId,
-                waitedMs: this.deps.tuning.limitNoticeAckMs,
-            })
-            done()
-        }, this.deps.tuning.limitNoticeAckMs)
-        this.limitNoticeTimer.unref?.()
-    }
-
-    private sendCloseBestEffort(reason: string): void {
-        if (this.closing) return
-        this.closing = true
-        const payload = this.delivery.sealClose(reason) ?? Buffer.alloc(0)
-        const sent = this.relay.send({ type: 'CLOSE', header: {}, payload })
-        log.info('channel.close_sent', { sent, authenticated: payload.byteLength > 0, terminal: true })
+        log.info('channel.close_sent', { code, sent, authenticated: payload.byteLength > 0 })
+        if (code === 'STUDY_COMPLETE') this.armCloseTimer()
     }
 
     private onCloseFrame(payload: Buffer): void {
@@ -274,16 +243,17 @@ export class Channel extends EventEmitter<ChannelEvents> {
             log.warn('channel.close_unverified', { bytes: payload.byteLength })
             return
         }
-        log.info('channel.close_received', { messageId: verified.messageId })
-        if (this.deps.lifecycle.state === 'CHANNEL_UP') {
-            this.deps.lifecycle.transition(
-                'CLOSING',
-                `peer CLOSE received (${verified.messageId}${verified.reason ? `: ${verified.reason}` : ''})`,
-            )
+        log.info('channel.close_received', { messageId: verified.messageId, code: verified.code })
+        const lifecycle = this.deps.lifecycle
+        const why = `peer CLOSE received (${verified.messageId}${verified.reason ? `: ${verified.reason}` : ''})`
+        if (verified.code === 'STUDY_COMPLETE') {
+            if (lifecycle.state === 'CHANNEL_UP') lifecycle.transition('CLOSING', why)
+        } else {
+            lifecycle.fail(verified.code === 'LIMIT_EXCEEDED' ? 'LIMIT_EXCEEDED' : 'ERRORED', why, verified.limit)
         }
         this.closing = true
         this.armCloseTimer()
-        this.emit('control', 'CLOSE', verified.messageId, verified.reason)
+        this.emit('peerClose', verified)
     }
 
     private armCloseTimer(): void {
@@ -300,10 +270,9 @@ export class Channel extends EventEmitter<ChannelEvents> {
         const lifecycle = this.deps.lifecycle
         if (lifecycle.isTerminal()) return
         if (lifecycle.state !== 'CLOSING') {
-            // The relay ended the session before any authenticated CLOSE reached us. Only the
-            // peer's authenticated CLOSE completes a study (v2 §7.6); the relay can end a session
-            // early, but it must not be able to make that look like completion (STUDY_COMPLETE,
-            // exit 0), so this is a session error — reported and exited as such.
+            // The relay ended the session before any authenticated CLOSE reached us. Only the peer's
+            // authenticated CLOSE completes a study (v2 §7.6): a relay can end a session early, but
+            // it must not be able to make that look like completion.
             log.error('channel.closed_without_close', { state: lifecycle.state, reason })
             lifecycle.fail('ERRORED', `relay closed the session without an authenticated CLOSE: ${reason}`)
             this.relay.stop()
@@ -320,26 +289,12 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.closeTimer = null
     }
 
-    private sendMsg1(): void {
-        if (!this.msg1 || this.stopped) return
-        this.handshakeAttempts++
-        if (this.handshakeAttempts > this.deps.tuning.handshakeMaxAttempts) {
-            log.error('channel.handshake_exhausted', { attempts: this.handshakeAttempts - 1 })
-            this.emit('handshakeFailed', 'max attempts')
-            return
-        }
-        const sent = this.relay.send({ type: 'HANDSHAKE', header: {}, payload: this.msg1 })
-        log.info('channel.handshake_sent', { attempt: this.handshakeAttempts, sent })
-        this.handshakeTimer = setTimeout(() => this.sendMsg1(), this.deps.tuning.handshakeRetryMs)
-        this.handshakeTimer.unref()
-    }
+    // ---- frames ----------------------------------------------------------------------------
 
     private onFrame(frame: Frame): void {
         switch (frame.type) {
             case 'HANDSHAKE':
                 return this.onHandshakeFrame(frame.payload)
-            case 'PEER_REJOINED':
-                return this.onPeerRejoined(frame.header.peerRole)
             case 'CLOSE':
                 return this.onCloseFrame(frame.payload)
             case 'CLOSE_ACK':
@@ -354,14 +309,11 @@ export class Channel extends EventEmitter<ChannelEvents> {
 
     private onHandshakeFrame(payload: Buffer): void {
         const session = this.session
-        if (!session) {
-            log.warn('channel.handshake_ignored', { reason: 'no session armed (peer key pending)' })
-            return
-        }
+        if (!session) return log.warn('channel.handshake_ignored', { reason: 'no session armed (peer key pending)' })
         if (this.deps.bundle.role === 'source') {
             if (session.complete) {
                 // A byte-identical message 1 means our message 2 was lost: re-answer, no new epoch.
-                if (this.cachedMsg2 && this.cachedMsg2.msg1.equals(payload)) {
+                if (this.cachedMsg2?.msg1.equals(payload)) {
                     this.relay.send({ type: 'HANDSHAKE', header: {}, payload: this.cachedMsg2.msg2 })
                     log.info('channel.handshake_reanswered', {})
                 } else {
@@ -380,11 +332,7 @@ export class Channel extends EventEmitter<ChannelEvents> {
             }
             return
         }
-        // destination (initiator)
-        if (session.complete) {
-            log.warn('channel.handshake_ignored', { reason: 'channel already established' })
-            return
-        }
+        if (session.complete) return log.warn('channel.handshake_ignored', { reason: 'channel already established' })
         try {
             session.readHandshake(payload)
             this.clearHandshakeTimer()
@@ -413,32 +361,9 @@ export class Channel extends EventEmitter<ChannelEvents> {
         this.emit('channelUp', session.epochTag!)
     }
 
-    private onPeerRejoined(peerRole: 'source' | 'destination'): void {
-        log.info('channel.peer_rejoined', { peerRole })
-        this.clearHandshakeTimer()
-        this.tearDownSession()
-        if (this.deps.lifecycle.state === 'CHANNEL_UP') {
-            this.deps.lifecycle.transition('RELAY_ATTACHED', 'peer rejoined with a new identity')
-        }
-        this.emit('peerRejoined', peerRole)
-    }
-
-    private onControl(control: ControlKind, messageId: string, reason?: string): void {
-        if (control === 'LIMIT_EXCEEDED') {
-            this.deps.lifecycle.fail('LIMIT_EXCEEDED', `peer reported cap breach${reason ? `: ${reason}` : ''}`)
-        }
-        this.emit('control', control, messageId, reason)
-    }
-
     private onLimitExceeded(error: LimitExceededError): void {
         log.error('channel.limit_exceeded', { side: error.side, limit: error.limit, used: error.used, max: error.max })
-        // Tell the destination through the authenticated channel, then stop for good.
-        try {
-            this.limitNoticeId = this.delivery.sendControl('LIMIT_EXCEEDED', `${error.side}:${error.limit}`)
-        } catch (sendError) {
-            log.warn('channel.limit_notice_not_sent', errorFields(sendError))
-        }
-        this.deps.lifecycle.fail('LIMIT_EXCEEDED', error.message)
+        this.deps.lifecycle.fail('LIMIT_EXCEEDED', error.message, error.detail)
         this.emit('limitExceeded', error)
     }
 

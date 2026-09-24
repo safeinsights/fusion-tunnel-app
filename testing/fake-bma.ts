@@ -11,8 +11,6 @@ import {
     type DelegatedCredentialClaims,
     type PeerKeyResponse,
     type PublishKeyRequest,
-    type RunLeg,
-    type RunStatus,
     type StatusReport,
 } from '@/schemas/bma'
 import type { CapsConsumed, Role } from '@/schemas/provisioning'
@@ -35,17 +33,6 @@ export type LegSession = {
     sessionNonce: string
 }
 
-export type Run = {
-    studyId: string
-    legs: RunLeg[]
-    status: RunStatus
-    eligible: Set<string> // `${legId}:${role}`
-    launched: Set<string>
-    launchWindowMs: number
-    windowTimer?: NodeJS.Timeout
-    failureReason?: string
-}
-
 export type FakeBmaOptions = {
     key?: BmaKeypair
     relayEndpoint: string
@@ -53,7 +40,8 @@ export type FakeBmaOptions = {
     orgs?: Record<string, string>
     relayTokenTtlS?: number
     credentialTtlS?: number
-    defaultLaunchWindowMs?: number
+    /** Bind address; 127.0.0.1 by default, 0.0.0.0 for compose. */
+    host?: string
 }
 
 export interface FakeBmaEvents {
@@ -62,9 +50,6 @@ export interface FakeBmaEvents {
     relaySessionIssued: [legId: string, role: Role, caller: 'org' | 'tunnel']
     credentialIssued: [legId: string, role: Role]
     statusReceived: [report: StatusReport]
-    runVisible: [studyId: string]
-    runPaired: [studyId: string]
-    runFailed: [studyId: string, reason: string]
     unauthorized: [path: string, reason: string]
 }
 
@@ -78,7 +63,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
     readonly rows: DirectoryRow[] = []
     readonly sessions = new Map<string, LegSession>() // `${studyId}/${legId}`
     readonly reports: StatusReport[] = []
-    readonly runs = new Map<string, Run>()
     readonly orgs: Record<string, string>
     /** Pending failures to inject: path prefix → count. */
     private failures = new Map<string, number>()
@@ -96,7 +80,7 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
     async start(port = 0): Promise<string> {
         await new Promise<void>((resolve, reject) => {
             this.server.once('error', reject)
-            this.server.listen(port, '127.0.0.1', () => resolve())
+            this.server.listen(port, this.options.host ?? '127.0.0.1', () => resolve())
         })
         const address = this.server.address()
         this.port = typeof address === 'object' && address ? address.port : port
@@ -108,7 +92,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
     }
 
     async stop(): Promise<void> {
-        for (const run of this.runs.values()) if (run.windowTimer) clearTimeout(run.windowTimer)
         await new Promise<void>((resolve) => this.server.close(() => resolve()))
     }
 
@@ -183,78 +166,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
         return { credential, expiresAt: new Date(exp * 1000).toISOString() }
     }
 
-    // ---- run groups ---------------------------------------------------------------------------
-
-    registerRun(studyId: string, legs: RunLeg[], launchWindowMs?: number): Run {
-        const run: Run = {
-            studyId,
-            legs,
-            status: 'pending',
-            eligible: new Set(),
-            launched: new Set(),
-            launchWindowMs: launchWindowMs ?? this.options.defaultLaunchWindowMs ?? 900_000,
-        }
-        this.runs.set(studyId, run)
-        return run
-    }
-
-    /** A side of a leg is launch-eligible; the run becomes visible only when every side of every leg is. */
-    setEligible(studyId: string, legId: string, role: Role, eligible = true): void {
-        const run = this.runs.get(studyId)
-        if (!run) throw new Error(`unknown run ${studyId}`)
-        const key = `${legId}:${role}`
-        if (eligible) run.eligible.add(key)
-        else run.eligible.delete(key)
-        const all = run.legs.every(
-            (leg) => run.eligible.has(`${leg.legId}:source`) && run.eligible.has(`${leg.legId}:destination`),
-        )
-        if (all && run.status === 'pending') {
-            run.status = 'visible'
-            this.emit('runVisible', studyId)
-        }
-    }
-
-    /** A Setup App reports its side launched; the launch window starts at the first report. */
-    reportLaunch(studyId: string, legId: string, role: Role): Run {
-        const run = this.runs.get(studyId)
-        if (!run) throw new Error(`unknown run ${studyId}`)
-        if (run.status !== 'visible' && run.status !== 'paired-running') return run
-        run.launched.add(`${legId}:${role}`)
-        if (!run.windowTimer && run.status === 'visible') {
-            run.windowTimer = setTimeout(() => this.failRun(studyId, 'launch window expired'), run.launchWindowMs)
-            run.windowTimer.unref()
-        }
-        const all = run.legs.every(
-            (leg) => run.launched.has(`${leg.legId}:source`) && run.launched.has(`${leg.legId}:destination`),
-        )
-        if (all) {
-            if (run.windowTimer) clearTimeout(run.windowTimer)
-            run.windowTimer = undefined
-            run.status = 'paired-running'
-            this.emit('runPaired', studyId)
-        }
-        return run
-    }
-
-    /** The hub's terminal job status: every source job of the study is marked complete. */
-    completeRun(studyId: string): void {
-        const run = this.runs.get(studyId)
-        if (!run) return
-        if (run.windowTimer) clearTimeout(run.windowTimer)
-        run.status = 'complete'
-    }
-
-    /** Atomic: every leg of the run fails together (plan §10, memo §2.4). */
-    failRun(studyId: string, reason: string): void {
-        const run = this.runs.get(studyId)
-        if (!run || run.status === 'complete' || run.status === 'failed') return
-        if (run.windowTimer) clearTimeout(run.windowTimer)
-        run.windowTimer = undefined
-        run.status = 'failed'
-        run.failureReason = reason
-        this.emit('runFailed', studyId, reason)
-    }
-
     // ---- http -------------------------------------------------------------------------------
 
     private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
@@ -282,10 +193,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
                     return this.postStatus(res, auth, body)
                 case 'GET /tunnel/consumed':
                     return this.getConsumed(res, auth, url)
-                case 'GET /tunnel/runs':
-                    return this.getRuns(res, auth, url)
-                case 'POST /tunnel/runs/launched':
-                    return this.postLaunched(res, auth, body)
                 case 'GET /api/health':
                     return this.json(res, 200, { success: true })
                 case 'GET /api/public-key':
@@ -415,15 +322,8 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
         const row = this.latest(studyId, legId, orgSlug)
         if (!row) return this.json(res, 409, { error: 'publish the tunnel key before requesting a relay session' })
         const peerRow = this.rows.find((r) => r.studyId === studyId && r.legId === legId && r.orgSlug !== orgSlug)
-        const run = this.runs.get(studyId)
-        const leg = run?.legs.find((l) => l.legId === legId)
-        // The leg's orgs come from the study record; the harness Setup App may also declare the peer.
-        const declaredPeer = url.searchParams.get('peerOrgSlug') ?? undefined
-        const peerOrgSlug = leg
-            ? role === 'source'
-                ? leg.destinationOrgSlug
-                : leg.sourceOrgSlug
-            : (declaredPeer ?? peerRow?.orgSlug ?? 'unknown')
+        // In production the leg's orgs come from the study record; the harness Setup App declares the peer.
+        const peerOrgSlug = url.searchParams.get('peerOrgSlug') ?? peerRow?.orgSlug ?? 'unknown'
         const [sourceOrg, destinationOrg] = role === 'source' ? [orgSlug, peerOrgSlug] : [peerOrgSlug, orgSlug]
         const session = this.sessionFor(studyId, legId)
         const ttl = this.options.relayTokenTtlS ?? 900
@@ -498,39 +398,6 @@ export class FakeBma extends EventEmitter<FakeBmaEvents> {
             return
         }
         this.json(res, 200, consumed)
-    }
-
-    /** Runs visible to an org: every leg where the org is a party, once all legs are launch-eligible. */
-    private getRuns(res: http.ServerResponse, auth: Auth, _url: URL): void {
-        const orgSlug = this.requireOrg(res, auth, '/tunnel/runs')
-        if (!orgSlug) return
-        const visible = [...this.runs.values()]
-            .filter((run) => run.status === 'visible' || run.status === 'paired-running')
-            .map((run) => ({
-                studyId: run.studyId,
-                status: run.status,
-                legs: run.legs
-                    .filter((leg) => leg.sourceOrgSlug === orgSlug || leg.destinationOrgSlug === orgSlug)
-                    .map((leg) => ({
-                        ...leg,
-                        role: leg.sourceOrgSlug === orgSlug ? ('source' as Role) : ('destination' as Role),
-                        jobId: leg.sourceOrgSlug === orgSlug ? leg.sourceJobId : leg.destinationJobId,
-                    })),
-            }))
-            .filter((run) => run.legs.length > 0)
-        this.json(res, 200, { runs: visible })
-    }
-
-    private postLaunched(res: http.ServerResponse, auth: Auth, body: unknown): void {
-        const orgSlug = this.requireOrg(res, auth, '/tunnel/runs/launched')
-        if (!orgSlug) return
-        const b = body as { studyId?: string; legId?: string; role?: Role }
-        if (!b?.studyId || !b.legId || (b.role !== 'source' && b.role !== 'destination')) {
-            return this.json(res, 400, { error: 'studyId, legId and role required' })
-        }
-        if (!this.runs.has(b.studyId)) return this.json(res, 404, { error: 'unknown run' })
-        const run = this.reportLaunch(b.studyId, b.legId, b.role)
-        this.json(res, 200, { status: run.status })
     }
 
     private nextGeneration(studyId: string, legId: string, orgSlug: string): number {

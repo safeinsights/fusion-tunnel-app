@@ -9,6 +9,7 @@ const main = async () => {
     const relay = new FakeRelay({
         bmaPublicKeyPem: pem,
         heartbeatIntervalMs: Number(env('HEARTBEAT_INTERVAL_MS', '30000')),
+        host: env('HOST', '127.0.0.1'),
     })
     const { port } = await relay.start(Number(env('PORT', '4400')))
     console.log(JSON.stringify({ event: 'fake-relay.listening', port }))

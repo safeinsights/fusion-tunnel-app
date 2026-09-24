@@ -1,4 +1,4 @@
-import type { Budget, DeliveredMessage, InfoResponse, TerminalBody } from '@/schemas/local-api'
+import type { Budget, DeliveredMessage, InfoResponse, TerminalBody } from '@/local-api'
 import type { TerminalCode } from '@/lib/lifecycle'
 
 // Scripted research-container drivers for the harness (plan Phase 9) — not a product SDK. They
@@ -177,7 +177,6 @@ export class DestinationRc {
                 if (res.status === 200 && isTerminal(res.body)) throw new TerminalError(res.body.code, peer.peerOrgSlug)
                 if (res.status === 200) {
                     const message = res.body as unknown as DeliveredMessage
-                    await this.post(peer, `/v1/messages/${message.messageId}/ack`, undefined)
                     if (message.budget) this.budgets.set(peer.peerOrgSlug, message.budget)
                     this.rounds.push({ peer: peer.peerOrgSlug, correlationId, reissues })
                     return {
@@ -191,7 +190,6 @@ export class DestinationRc {
                     reissue = true // the tunnel restarted and lost the round
                     break
                 }
-                if (res.status === 410 && isTerminal(res.body)) throw new TerminalError(res.body.code, peer.peerOrgSlug)
                 if (res.status !== 204) await sleep(this.options.pollMs ?? 50)
             }
             void reissue
@@ -271,15 +269,7 @@ export class SourceRc {
             }
             if (res.status !== 200) throw new Error(`messages/next failed: ${res.status} ${JSON.stringify(res.body)}`)
             const message = res.body as unknown as DeliveredMessage
-            // stage two first, then serve; a redelivered correlationId replays the memoized answer
-            await call(
-                this.fetchImpl,
-                this.endpoint,
-                'POST',
-                `/v1/messages/${message.messageId}/ack`,
-                undefined,
-                this.httpTimeoutMs,
-            )
+            // a redelivered correlationId replays the memoized answer
             const replayed = this.memo.has(message.correlationId)
             const answer = replayed ? this.memo.get(message.correlationId) : await this.run(message)
             this.memo.set(message.correlationId, answer)
@@ -297,7 +287,7 @@ export class SourceRc {
                 { inReplyTo: message.correlationId, payload: answer },
                 this.httpTimeoutMs,
             )
-            if (posted.status === 410 && isTerminal(posted.body)) throw new TerminalError(posted.body.code)
+            if (posted.status === 200 && isTerminal(posted.body)) throw new TerminalError(posted.body.code)
             if (posted.status !== 202)
                 throw new Error(`messages failed: ${posted.status} ${JSON.stringify(posted.body)}`)
         }

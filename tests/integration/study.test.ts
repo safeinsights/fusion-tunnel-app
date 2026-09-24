@@ -29,13 +29,11 @@ describe('two-party study through the fake BMA and relay', () => {
         { timeout: T },
         async () => {
             study = await startStudy({ legs: [{ legId: 'leg-a', sourceOrg: 'dp-a', caps: { maxRounds: 50 } }] })
-            expect(study.bma.runs.get(study.studyId)!.status).toBe('paired-running')
             await study.waitChannelsUp()
             const exits: number[] = []
             for (const side of [study.leg('leg-a').source, study.leg('leg-a').destination]) {
                 installExitPolicy(side.tunnel, { exit: (c) => exits.push(c), graceMs: 10 })
             }
-
             const source = new SourceRc(study.sourceEndpoint('leg-a'), handlerFor('A'), { readinessTimeoutMs: 15_000 })
             const serving = source.serve()
             const hub = await DestinationRc.connect({
@@ -74,13 +72,12 @@ describe('hub study: two legs, one destination enclave', () => {
         await study?.close()
     })
 
-    const twoLegs = (extra: Partial<Parameters<typeof startStudy>[0]> = {}) =>
+    const twoLegs = () =>
         startStudy({
             legs: [
                 { legId: 'leg-a', sourceOrg: 'dp-a' },
                 { legId: 'leg-b', sourceOrg: 'dp-b' },
             ],
-            ...extra,
         })
 
     it(
@@ -93,7 +90,6 @@ describe('hub study: two legs, one destination enclave', () => {
             const b = new SourceRc(study.sourceEndpoint('leg-b'), handlerFor('B'))
             const servingA = a.serve()
             const servingB = b.serve()
-            // rejections are asserted later; mark them handled now so a fast failure is not reported as unhandled
             servingA.catch(() => undefined)
             servingB.catch(() => undefined)
             const hub = await DestinationRc.connect(study.hubEndpoints())
@@ -120,8 +116,7 @@ describe('hub study: two legs, one destination enclave', () => {
                 study.leg('leg-b').destination.tunnel.identity.connectionId,
             )
 
-            const completed = await hub.complete()
-            expect(completed).toEqual({ 'dp-a': 'CLOSING', 'dp-b': 'CLOSING' })
+            expect(await hub.complete()).toEqual({ 'dp-a': 'CLOSING', 'dp-b': 'CLOSING' })
             expect(await Promise.all([servingA, servingB])).toEqual(['STUDY_COMPLETE', 'STUDY_COMPLETE'])
             await until(
                 () =>
@@ -150,7 +145,7 @@ describe('hub study: two legs, one destination enclave', () => {
         "a key blob signed by source B's org key fails verification at source A (the pin holds)",
         { timeout: T },
         async () => {
-            study = await twoLegs({ skipRunGroup: true })
+            study = await twoLegs()
             await study.waitChannelsUp()
             const sourceA = study.leg('leg-a').source.tunnel
             const rejected = new Promise<string>((resolve) => sourceA.bma!.once('peerKeyRejected', resolve))
@@ -162,7 +157,7 @@ describe('hub study: two legs, one destination enclave', () => {
                     jobId: 'job-si-hub',
                     legId: 'leg-a',
                     ...impostor.toIdentityResponse(),
-                    keySignature: signKeyBlob(study.orgKeys['dp-b'].privateKey, {
+                    keySignature: signKeyBlob(study.orgKeys['dp-b']!.privateKey, {
                         studyId: study.studyId,
                         jobId: 'job-si-hub',
                         legId: 'leg-a',
@@ -187,11 +182,8 @@ describe('hub study: two legs, one destination enclave', () => {
         await study.waitChannelsUp()
         const epochB = study.leg('leg-b').destination.tunnel.channel!.epochTag
         const historyB = study.leg('leg-b').source.tunnel.lifecycle.history.length
-        const relaySessionB = study.relay.session(study.relaySessionId('leg-b'))!
         const next = await study.restart('leg-a', 'destination')
         expect(next.tunnel.lifecycle.state).toBe('CHANNEL_UP')
-        expect(study.relay.session(study.relaySessionId('leg-a'))!.epoch).toBe(1)
-        expect(relaySessionB.epoch).toBe(0)
         expect(study.leg('leg-b').destination.tunnel.channel!.epochTag).toBe(epochB)
         expect(study.leg('leg-b').source.tunnel.lifecycle.history.length).toBe(historyB)
         expect(
@@ -200,6 +192,9 @@ describe('hub study: two legs, one destination enclave', () => {
                 .source.tunnel.lifecycle.history.map((t) => t.to)
                 .slice(-2),
         ).toEqual(['RELAY_ATTACHED', 'CHANNEL_UP'])
+        expect(study.relay.session(study.relaySessionId('leg-a'))!.fingerprints.destination).toBe(
+            next.tunnel.identity.fingerprint,
+        )
 
         // both legs still serve
         const a = new SourceRc(study.sourceEndpoint('leg-a'), handlerFor('A'))
@@ -218,38 +213,17 @@ describe('hub study: two legs, one destination enclave', () => {
         'a query-side cap breach on leg B terminates leg B alone with a typed error at the hub',
         { timeout: T },
         async () => {
-            study = await twoLegs()
-            study.legs[1].source.tunnel.stop()
-            await study.legs[1].source.close()
-            // re-provision source B with a tiny query cap (the harness caps are per leg spec; do it by hand)
-            const spec = { legId: 'leg-b', sourceOrg: 'dp-b', caps: { maxQueryPlaintextBytesPerRound: 60 } }
-            const replaced = await (async () => {
-                const { startTunnel } = await import('@/testing/fixtures')
-                const running = await startTunnel({
-                    env: { FUSION_PEERKEY_POLL_MS: '50', FUSION_HANDSHAKE_RETRY_MS: '50', FUSION_LONGPOLL_MS: '150' },
-                    deps: { bma: {} },
-                })
-                const token = 'token-leg-b-source-capped-0123456789'
-                await study.setupApps['dp-b'].provision(running.baseUrl, {
-                    studyId: study.studyId,
-                    jobId: 'job-dp-b',
-                    legId: 'leg-b',
-                    role: 'source',
-                    peerOrgSlug: study.destinationOrg,
-                    peerOrgPublicKeyPem: study.orgKeys[study.destinationOrg].pem,
-                    localApiToken: token,
-                    caps: spec.caps,
-                })
-                return { ...running, role: 'source' as const, legId: 'leg-b', org: 'dp-b', token, jobId: 'job-dp-b' }
-            })()
-            study.legs[1].source = replaced
+            study = await startStudy({
+                legs: [
+                    { legId: 'leg-a', sourceOrg: 'dp-a' },
+                    { legId: 'leg-b', sourceOrg: 'dp-b', caps: { maxQueryPlaintextBytesPerRound: 60 } },
+                ],
+            })
             await study.waitChannelsUp()
-
             const a = new SourceRc(study.sourceEndpoint('leg-a'), handlerFor('A'))
             const b = new SourceRc(study.sourceEndpoint('leg-b'), handlerFor('B'))
             const servingA = a.serve()
             const servingB = b.serve()
-            // rejections are asserted later; mark them handled now so a fast failure is not reported as unhandled
             servingA.catch(() => undefined)
             servingB.catch(() => undefined)
             const hub = await DestinationRc.connect(study.hubEndpoints())
@@ -270,38 +244,4 @@ describe('hub study: two legs, one destination enclave', () => {
             await servingA.catch(() => undefined)
         },
     )
-
-    it("the fake BMA's run group fails atomically when one leg never launches", { timeout: T }, async () => {
-        study = await twoLegs({ skipRunGroup: true, launchWindowMs: 200 })
-        study.bma.registerRun(
-            study.studyId,
-            [
-                {
-                    legId: 'leg-a',
-                    sourceOrgSlug: 'dp-a',
-                    destinationOrgSlug: 'si-hub',
-                    sourceJobId: 'job-dp-a',
-                    destinationJobId: 'job-si-hub',
-                },
-                {
-                    legId: 'leg-b',
-                    sourceOrgSlug: 'dp-b',
-                    destinationOrgSlug: 'si-hub',
-                    sourceJobId: 'job-dp-b',
-                    destinationJobId: 'job-si-hub',
-                },
-            ],
-            200,
-        )
-        for (const leg of ['leg-a', 'leg-b'])
-            for (const role of ['source', 'destination'] as const) study.bma.setEligible(study.studyId, leg, role)
-        const failed = new Promise<string>((resolve) => study.bma.once('runFailed', (_s, reason) => resolve(reason)))
-        await study.setupApps['dp-a'].reportLaunch(study.studyId, 'leg-a', 'source')
-        await study.setupApps['si-hub'].reportLaunch(study.studyId, 'leg-a', 'destination')
-        await study.setupApps['si-hub'].reportLaunch(study.studyId, 'leg-b', 'destination')
-        // dp-b never launches
-        expect(await failed).toBe('launch window expired')
-        expect(study.bma.runs.get(study.studyId)!.status).toBe('failed')
-        expect(await study.setupApps['dp-a'].visibleRuns()).toEqual({ runs: [] })
-    })
 })

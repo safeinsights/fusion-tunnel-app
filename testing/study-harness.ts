@@ -28,9 +28,6 @@ export type StudyOptions = {
     env?: Record<string, string>
     relayOptions?: Partial<FakeRelayOptions>
     bmaOptions?: Partial<FakeBmaOptions>
-    launchWindowMs?: number
-    /** Skip run-group registration/launch reporting (tests that exercise the group themselves). */
-    skipRunGroup?: boolean
 }
 
 export type StudyTunnel = RunningTunnel & { role: Role; legId: string; org: string; token: string; jobId: string }
@@ -90,24 +87,6 @@ export const startStudy = async (options: StudyOptions): Promise<Study> => {
         orgs.map((org) => [org, new FakeSetupApp(org, orgKeys[org], bma.url)]),
     )
 
-    if (!options.skipRunGroup) {
-        bma.registerRun(
-            studyId,
-            options.legs.map((leg) => ({
-                legId: leg.legId,
-                sourceOrgSlug: leg.sourceOrg,
-                destinationOrgSlug: destinationOrg,
-                sourceJobId: `job-${leg.sourceOrg}`,
-                destinationJobId: `job-${destinationOrg}`,
-            })),
-            options.launchWindowMs,
-        )
-        for (const leg of options.legs) {
-            bma.setEligible(studyId, leg.legId, 'source')
-            bma.setEligible(studyId, leg.legId, 'destination')
-        }
-    }
-
     const provision = async (leg: LegSpec, role: Role, capsFromBma = false): Promise<StudyTunnel> => {
         const org = role === 'source' ? leg.sourceOrg : destinationOrg
         const peerOrg = role === 'source' ? destinationOrg : leg.sourceOrg
@@ -129,7 +108,6 @@ export const startStudy = async (options: StudyOptions): Promise<Study> => {
             capsConsumed: role === 'source' && capsFromBma ? 'bma' : undefined,
         })
         if (result.configureStatus !== 200) throw new Error(`configure returned ${result.configureStatus}`)
-        if (!options.skipRunGroup) await setupApps[org].reportLaunch(studyId, leg.legId, role)
         return { ...running, role, legId: leg.legId, org, token, jobId }
     }
 

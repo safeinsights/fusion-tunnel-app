@@ -1,29 +1,18 @@
 import type http from 'node:http'
+import { createPublicKey } from 'node:crypto'
 import type { ServerConfig } from '@/config'
-import { createHttpServer } from '@/http/server'
-import type { Router } from '@/http/router'
-import { canonicalJson } from '@/lib/canonical'
+import { bearerMatches, createHttpServer, error, ok, parseBody, Router, type Req, type Res } from '@/http'
 import { BmaClient } from '@/lib/bma/client'
-import { installRecovery } from '@/lib/recovery'
-import { Channel, type ChannelDeps, type VerifiedPeer } from '@/lib/channel'
+import type { VerifiedPeer } from '@/lib/bma/verify-peer-key'
+import { Channel, type ChannelDeps } from '@/lib/channel'
 import { createIdentity, type Identity } from '@/lib/identity'
-import { Exchange, nullTransport, type ExchangeTransport } from '@/lib/exchange'
+import { Exchange, type ExchangeTransport } from '@/lib/exchange'
 import { Lifecycle, TERMINAL_STATES } from '@/lib/lifecycle'
 import { LongPoll } from '@/lib/long-poll'
 import { log } from '@/lib/logger'
+import { NEXT_QUERY_KEY, registerLocalApi, terminalBody, type DeliveredMessage } from '@/local-api'
 import { CapsMeter } from '@/reliability/caps'
-import type { DeliveredMessage } from '@/schemas/local-api'
-import type { ConfigurationBundle } from '@/schemas/provisioning'
-import { health } from '@/routes/health'
-import { localIdentity } from '@/routes/local-identity'
-import { localConfigure } from '@/routes/local-configure'
-import { info } from '@/routes/info'
-import { request } from '@/routes/request'
-import { responses } from '@/routes/responses'
-import { messagesNext, NEXT_QUERY_KEY } from '@/routes/messages-next'
-import { messages } from '@/routes/messages'
-import { messageAck } from '@/routes/message-ack'
-import { complete } from '@/routes/complete'
+import { ConfigurationBundleSchema, type ConfigurationBundle } from '@/schemas/provisioning'
 
 export type ConfigureResult = 'configured' | 'unchanged' | 'conflict' | 'terminal'
 
@@ -32,25 +21,24 @@ export type TunnelDeps = {
     /** Replaces the channel's delivery as the exchange transport (unit tests). */
     transport?: ExchangeTransport
     now?: () => Date
-    channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider' | 'blobClient' | 'fetch'>
+    channelDeps?: Pick<ChannelDeps, 'relayFactory' | 'tokenProvider'>
     /** `null` disables the BMA client (harnesses that play the directory themselves). */
     bma?: null | { fetch?: typeof fetch }
 }
 
 /**
  * One tunnel instance: identity, lifecycle, the configuration bundle once provisioned, the
- * plaintext exchange, the channel (relay + Noise + delivery), the long-poll registries and the
- * HTTP server that exposes all of it. Nothing is module-level, so a process can host several
- * instances (in-process harness).
+ * plaintext exchange, the channel (relay + Noise + delivery), the long-poll registry and the HTTP
+ * server that exposes all of it. Nothing is module-level, so a process can host several instances
+ * (in-process harness).
  */
 export type Tunnel = {
     readonly config: ServerConfig
     readonly identity: Identity
     readonly lifecycle: Lifecycle
-    readonly router: Router
     readonly server: http.Server
-    readonly responseWaiters: LongPoll<DeliveredMessage>
-    readonly queryWaiters: LongPoll<DeliveredMessage>
+    /** Long-poll waiters keyed by correlationId (destination) or NEXT_QUERY_KEY (source). */
+    readonly waiters: LongPoll<DeliveredMessage>
     readonly bundle: ConfigurationBundle | undefined
     readonly exchange: Exchange | undefined
     readonly channel: Channel | undefined
@@ -64,26 +52,23 @@ export type Tunnel = {
     stop(): void
 }
 
-export const registerRoutes = (router: Router, tunnel: Tunnel): void => {
-    router.register('GET', '/health', health(tunnel))
-    router.register('GET', '/local/identity', localIdentity(tunnel))
-    router.register('POST', '/local/configure', localConfigure(tunnel))
-    router.register('GET', '/v1/info', info(tunnel))
-    router.register('POST', '/v1/request', request(tunnel))
-    router.register('GET', '/v1/responses/:correlationId', responses(tunnel))
-    router.register('GET', '/v1/messages/next', messagesNext(tunnel))
-    router.register('POST', '/v1/messages', messages(tunnel))
-    router.register('POST', '/v1/messages/:id/ack', messageAck(tunnel))
-    router.register('POST', '/v1/complete', complete(tunnel))
-}
+// Deterministic JSON so an identical bundle compares equal regardless of key order (idempotent configure).
+const canonical = (value: unknown): string =>
+    JSON.stringify(value, (_key, v) =>
+        v && typeof v === 'object' && !Array.isArray(v)
+            ? Object.fromEntries(
+                  Object.keys(v as object)
+                      .sort()
+                      .map((k) => [k, (v as Record<string, unknown>)[k]]),
+              )
+            : v,
+    )
 
 export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunnel => {
     const now = deps.now ?? (() => new Date())
     const identity = deps.identity ?? createIdentity()
     const lifecycle = new Lifecycle(now)
-    const responseWaiters = new LongPoll<DeliveredMessage>()
-    const queryWaiters = new LongPoll<DeliveredMessage>()
-    let transport: ExchangeTransport = deps.transport ?? nullTransport
+    const waiters = new LongPoll<DeliveredMessage>()
     let bundle: ConfigurationBundle | undefined
     let exchange: Exchange | undefined
     let channel: Channel | undefined
@@ -99,23 +84,18 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             role: bundle?.role,
         })
         // Ending or ended: wake every held long-poll so the RC sees the terminal body promptly.
-        if (transition.to === 'CLOSING' || TERMINAL_STATES.has(transition.to)) {
-            responseWaiters.resolveAll(undefined)
-            queryWaiters.resolveAll(undefined)
-        }
+        if (transition.to === 'CLOSING' || TERMINAL_STATES.has(transition.to)) waiters.resolveAll(undefined)
     })
 
     const onDelivered = (message: DeliveredMessage): void => {
-        if (bundle?.role === 'source') queryWaiters.resolve(NEXT_QUERY_KEY, message)
-        else responseWaiters.resolve(message.correlationId, message)
+        waiters.resolve(bundle?.role === 'source' ? NEXT_QUERY_KEY : message.correlationId, message)
     }
 
     const tunnel: Tunnel = {
         config,
         identity,
         lifecycle,
-        responseWaiters,
-        queryWaiters,
+        waiters,
         get bundle() {
             return bundle
         },
@@ -131,12 +111,10 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
         get bma() {
             return bma
         },
-        // Assigned below once the HTTP server exists.
-        router: undefined as unknown as Router,
-        server: undefined as unknown as http.Server,
+        server: undefined as unknown as http.Server, // assigned below
         configure(next) {
             if (lifecycle.isTerminal()) return 'terminal'
-            if (bundle) return canonicalJson(bundle) === canonicalJson(next) ? 'unchanged' : 'conflict'
+            if (bundle) return canonical(bundle) === canonical(next) ? 'unchanged' : 'conflict'
             bundle = next
             exchange = new Exchange(next.role, { onDelivered, now })
             // Only the source meters caps: the party whose data is at risk enforces (§7.3).
@@ -155,7 +133,6 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
                 ...deps.channelDeps,
             })
             exchange.setTransport(deps.transport ?? channel.delivery)
-            transport = deps.transport ?? channel.delivery
             lifecycle.transition('CONFIGURED', 'configuration bundle accepted')
             if (deps.bma !== null) {
                 bma = new BmaClient({
@@ -172,7 +149,10 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
                 })
                 bma.start()
             }
-            installRecovery({ channel, bma, lifecycle })
+            // Recovery (v2 §8): a peer that rejoined with new keys needs a fresh directory fetch; an
+            // initiator that exhausted its handshake attempts cannot come up.
+            channel.on('peerRejoined', () => bma?.refetchPeerKey())
+            channel.on('handshakeFailed', (reason) => lifecycle.fail('ERRORED', `handshake: ${reason}`))
             log.info('tunnel.configured', {
                 studyId: next.studyId,
                 jobId: next.jobId,
@@ -185,33 +165,65 @@ export const createTunnel = (config: ServerConfig, deps: TunnelDeps = {}): Tunne
             return 'configured'
         },
         setTransport(next) {
-            transport = next
             exchange?.setTransport(next)
         },
         verifiedPeer(peer) {
             if (!channel) throw new Error('tunnel is not configured')
+            channel.setPeer(peer)
             if (lifecycle.state === 'CONFIGURED') {
-                channel.setPeer(peer)
                 lifecycle.transition('PEER_KEY_VERIFIED', `peer key verified (generation ${peer.generation})`)
                 channel.attach()
-                return
             }
-            // Re-verification after PEER_REJOINED (or a refreshed key): arm a new handshake.
-            channel.setPeer(peer)
         },
         complete(reason) {
             lifecycle.transition('CLOSING', reason)
-            channel?.close(reason)
+            channel?.close('STUDY_COMPLETE', reason)
         },
         stop() {
             bma?.stop()
             channel?.stop()
         },
     }
-    void transport
 
-    const app = createHttpServer((router) => registerRoutes(router, tunnel))
-    Object.assign(tunnel, { router: app.router, server: app.server })
+    const router = new Router()
+    router.register('GET', '/health', () => ok({ success: true, message: { status: 'ok', state: lifecycle.state } }))
+    router.register('GET', '/local/identity', (req) => provisioning(req) ?? ok(identity.toIdentityResponse()))
+    router.register('POST', '/local/configure', (req) => {
+        const denied = provisioning(req)
+        if (denied) return denied
+        const parsed = parseBody(req, ConfigurationBundleSchema)
+        if (!parsed.ok) return parsed.res
+        try {
+            createPublicKey(parsed.data.peerOrgPublicKey)
+        } catch {
+            return error(400, 'VALIDATION', 'peerOrgPublicKey is not a valid public key PEM', {
+                issues: [{ path: 'peerOrgPublicKey', message: 'unparseable public key' }],
+            })
+        }
+        const result = tunnel.configure(parsed.data)
+        if (result === 'conflict') return error(409, 'CONFLICT', 'tunnel is already configured with a different bundle')
+        if (result === 'terminal') return ok(terminalBody(tunnel))
+        return ok({ state: lifecycle.state, configured: result === 'configured' })
+    })
+    registerLocalApi(router, tunnel)
+
+    /**
+     * The front door for the provisioning API: the Setup App's bootstrap bearer, checked constant-time
+     * like the RC token. The research container shares the tunnel's network namespace and must not be
+     * able to provision it. A tunnel without a token configured (tests only; `main()` refuses to boot)
+     * answers 401 to all.
+     */
+    function provisioning(req: Req): Res | undefined {
+        const expected = config.provisionToken
+        if (expected === undefined || !bearerMatches(req.headers, expected))
+            return error(401, 'UNAUTHORIZED', 'missing or invalid provisioning token')
+        return undefined
+    }
+
+    // Local-API bodies are plaintext; the RC hands a whole message over in one request.
+    Object.assign(tunnel, {
+        server: createHttpServer(router, { maxBodyBytes: config.tuning.maxMessageBytes + 64 * 1024 }),
+    })
     log.info('tunnel.identity_generated', { connectionId: identity.connectionId, fingerprint: identity.fingerprint })
     return tunnel
 }

@@ -233,68 +233,6 @@ describe('FakeBma', () => {
         }
     })
 
-    it('runs become visible only when every side of every leg is eligible and fail atomically on window expiry', async () => {
-        const fresh = new FakeBma({
-            relayEndpoint: 'ws://relay.test/ws',
-            orgs: { 'dp-a': dpA.pem, 'si-hub': hub.pem, 'dp-b': makeOrgKey().pem },
-        })
-        await fresh.start()
-        try {
-            const legs = [
-                {
-                    legId: 'leg-a',
-                    sourceOrgSlug: 'dp-a',
-                    destinationOrgSlug: 'si-hub',
-                    sourceJobId: 'job-a',
-                    destinationJobId: 'job-hub',
-                },
-                {
-                    legId: 'leg-b',
-                    sourceOrgSlug: 'dp-b',
-                    destinationOrgSlug: 'si-hub',
-                    sourceJobId: 'job-b',
-                    destinationJobId: 'job-hub',
-                },
-            ]
-            fresh.registerRun('study-hub', legs, 30)
-            const a = new FakeSetupApp('dp-a', dpA, fresh.url)
-            expect(await a.visibleRuns()).toEqual({ runs: [] })
-            fresh.setEligible('study-hub', 'leg-a', 'source')
-            fresh.setEligible('study-hub', 'leg-a', 'destination')
-            fresh.setEligible('study-hub', 'leg-b', 'source')
-            expect(await a.visibleRuns()).toEqual({ runs: [] })
-            const visible = new Promise<string>((resolve) => fresh.once('runVisible', resolve))
-            fresh.setEligible('study-hub', 'leg-b', 'destination')
-            expect(await visible).toBe('study-hub')
-            const runs = (await a.visibleRuns()) as {
-                runs: { studyId: string; legs: { legId: string; role: string; jobId: string }[] }[]
-            }
-            expect(runs.runs[0].legs).toEqual([
-                expect.objectContaining({ legId: 'leg-a', role: 'source', jobId: 'job-a' }),
-            ])
-            const failed = new Promise<string>((resolve) => fresh.once('runFailed', (_s, reason) => resolve(reason)))
-            expect(await a.reportLaunch('study-hub', 'leg-a', 'source')).toBe(200)
-            expect(await failed).toBe('launch window expired')
-            expect(fresh.runs.get('study-hub')!.status).toBe('failed')
-            expect(await a.visibleRuns()).toEqual({ runs: [] })
-            expect(await a.reportLaunch('nope', 'leg-a', 'source')).toBe(404)
-
-            fresh.registerRun('study-2', [legs[0]], 5000)
-            fresh.setEligible('study-2', 'leg-a', 'source')
-            fresh.setEligible('study-2', 'leg-a', 'destination')
-            const paired = new Promise<string>((resolve) => fresh.once('runPaired', resolve))
-            await a.reportLaunch('study-2', 'leg-a', 'source')
-            await new FakeSetupApp('si-hub', hub, fresh.url).reportLaunch('study-2', 'leg-a', 'destination')
-            expect(await paired).toBe('study-2')
-            fresh.completeRun('study-2')
-            expect(fresh.runs.get('study-2')!.status).toBe('complete')
-            fresh.failRun('study-2', 'too late')
-            expect(fresh.runs.get('study-2')!.status).toBe('complete')
-        } finally {
-            await fresh.stop()
-        }
-    })
-
     it('injects failures and latency', async () => {
         bma.failNext('/api/health', 1)
         expect((await fetch(`${bma.url}/api/health`)).status).toBe(503)

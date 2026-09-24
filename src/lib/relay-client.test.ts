@@ -1,31 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { randomBytes } from 'node:crypto'
-import { v4 as uuidv4 } from 'uuid'
-import { RelayClient, type RelayClientOptions } from './client'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { RelayClient, type RelayClientOptions } from './relay-client'
 import { createIdentity, type Identity } from '@/lib/identity'
 import { NoiseSession } from '@/lib/noise/session'
 import { encodePrologue } from '@/lib/noise/prologue'
-import type { Frame, RelayRole } from '@/schemas/relay-wire'
+import type { Frame, Role } from '@/relay-protocol'
 import { FakeRelay } from '@/testing/fake-relay'
 import { mintRelayToken, testBmaKey, makeBmaKey } from '@/testing/relay-tokens'
+import { until } from '@/testing/pair-harness'
 
 const TUNING = { heartbeatMs: 30_000, heartbeatMisses: 2, reconnectMinMs: 10, reconnectMaxMs: 40 }
 
-const waitFor = <T>(fn: () => T | undefined, timeoutMs = 2000): Promise<T> =>
-    new Promise((resolve, reject) => {
-        const started = Date.now()
-        const poll = () => {
-            const value = fn()
-            if (value !== undefined) return resolve(value)
-            if (Date.now() - started > timeoutMs) return reject(new Error('condition not met in time'))
-            setTimeout(poll, 5)
-        }
-        poll()
-    })
-
 const once = <T>(
     client: RelayClient,
-    event: 'admitted' | 'fatal' | 'rejected' | 'disconnected' | 'displaced' | 'reconnecting',
+    event: 'admitted' | 'fatal' | 'disconnected' | 'peer',
     timeoutMs = 2000,
 ): Promise<T> =>
     new Promise((resolve, reject) => {
@@ -39,7 +27,7 @@ const once = <T>(
 const makeClient = (
     relay: FakeRelay,
     identity: Identity,
-    role: RelayRole,
+    role: Role,
     relaySessionId: string,
     overrides: Partial<RelayClientOptions> = {},
 ) =>
@@ -79,73 +67,69 @@ describe('RelayClient against the fake relay', () => {
         return client
     }
 
-    it('admits a valid token + proof of possession, adopts the advertised limits and role', async () => {
+    it('admits a valid token + proof of possession and learns the peer is absent', async () => {
         const identity = createIdentity()
         const client = track(makeClient(relay, identity, 'source', 'rs-admit'))
-        const admitted = once<{ limits: { windowMsgs: number } }>(client, 'admitted')
+        const admitted = once<{ peer: { attached: boolean } }>(client, 'admitted')
         client.start()
         const header = await admitted
         expect(client.state).toBe('admitted')
-        expect(client.limits).toEqual(relay.limits)
-        expect(header.limits.windowMsgs).toBe(64)
+        expect(header.peer).toEqual({ attached: false })
+        expect(client.peerAttached).toBe(false)
         expect(relay.isLive('rs-admit', 'source')).toBe(true)
         expect(relay.session('rs-admit')?.fingerprints.source).toBe(identity.fingerprint)
         client.start() // no-op while running
         expect(client.state).toBe('admitted')
     })
 
+    it('tells each side about the other with its fingerprint, on attach and on detach', async () => {
+        const src = createIdentity()
+        const dst = createIdentity()
+        const source = track(makeClient(relay, src, 'source', 'rs-peer'))
+        const srcAdmitted = once(source, 'admitted')
+        source.start()
+        await srcAdmitted
+        const peerSeen = once<{ attached: boolean; fingerprint?: string }>(source, 'peer')
+        const destination = track(makeClient(relay, dst, 'destination', 'rs-peer'))
+        const dstAdmitted = once<{ peer: { attached: boolean; fingerprint?: string } }>(destination, 'admitted')
+        destination.start()
+        expect((await dstAdmitted).peer).toEqual({ attached: true, fingerprint: src.fingerprint })
+        expect(await peerSeen).toEqual({ attached: true, fingerprint: dst.fingerprint })
+        expect(source.peerAttached).toBe(true)
+        const gone = once<{ attached: boolean; fingerprint?: string }>(source, 'peer')
+        destination.stop()
+        expect(await gone).toEqual({ attached: false, fingerprint: dst.fingerprint })
+        expect(source.peerAttached).toBe(false)
+    })
+
     it('rejects a token signed by the wrong key, an expired token, and a bad audience, then keeps retrying', async () => {
         const identity = createIdentity()
         const wrongKey = makeBmaKey()
         let attempts = 0
+        const base = {
+            relaySessionId: 'rs-badtoken',
+            role: 'source' as const,
+            fingerprint: identity.fingerprint,
+            popKey: identity.popKey,
+        }
         const client = track(
             makeClient(relay, identity, 'source', 'rs-badtoken', {
                 tokenProvider: () => {
                     attempts++
-                    if (attempts === 1) {
-                        return mintRelayToken({
-                            relaySessionId: 'rs-badtoken',
-                            role: 'source',
-                            fingerprint: identity.fingerprint,
-                            popKey: identity.popKey,
-                            key: wrongKey,
-                        })
-                    }
-                    if (attempts === 2) {
-                        return mintRelayToken({
-                            relaySessionId: 'rs-badtoken',
-                            role: 'source',
-                            fingerprint: identity.fingerprint,
-                            popKey: identity.popKey,
-                            expiresInS: -3600,
-                        })
-                    }
-                    if (attempts === 3) {
-                        return mintRelayToken({
-                            relaySessionId: 'rs-badtoken',
-                            role: 'source',
-                            fingerprint: identity.fingerprint,
-                            popKey: identity.popKey,
-                            overrides: { aud: 'other' },
-                        })
-                    }
-                    return mintRelayToken({
-                        relaySessionId: 'rs-badtoken',
-                        role: 'source',
-                        fingerprint: identity.fingerprint,
-                        popKey: identity.popKey,
-                    })
+                    if (attempts === 1) return mintRelayToken({ ...base, key: wrongKey })
+                    if (attempts === 2) return mintRelayToken({ ...base, expiresInS: -3600 })
+                    if (attempts === 3) return mintRelayToken({ ...base, overrides: { aud: 'other' } })
+                    return mintRelayToken(base)
                 },
             }),
         )
         const rejections: string[] = []
-        client.on('rejected', (h) => rejections.push(h.code))
+        relay.on('rejected', (code) => rejections.push(code))
         const admitted = once(client, 'admitted', 5000)
         client.start()
         await admitted
         expect(rejections).toEqual(['AUTH_TOKEN_INVALID', 'AUTH_TOKEN_EXPIRED', 'AUTH_TOKEN_INVALID'])
         expect(attempts).toBe(4)
-        expect(client.reconnectAttempts).toBe(0) // reset on admission
     })
 
     it('a token whose popKey does not match our signing key fails PoP and is fatal (provisioning error)', async () => {
@@ -193,16 +177,12 @@ describe('RelayClient against the fake relay', () => {
         const client = track(makeClient(relay, identity, 'destination', 'rs-drop', { random: () => 0.5 }))
         let admissions = 0
         client.on('admitted', () => admissions++)
-        const reconnecting = once<{ attempt: number; delayMs: number }>(client, 'reconnecting')
+        const disconnected = once<{ code: number; wasAdmitted: boolean }>(client, 'disconnected')
         client.start()
-        await waitFor(() => (admissions === 1 ? true : undefined))
+        await until(() => (admissions === 1 ? true : undefined))
         expect(relay.dropSocket('rs-drop', 'destination')).toBe(true)
-        const info = await reconnecting
-        expect(info.attempt).toBe(1)
-        expect(info.delayMs).toBeGreaterThanOrEqual(5)
-        expect(info.delayMs).toBeLessThanOrEqual(10)
-        await waitFor(() => (admissions === 2 ? true : undefined))
-        expect(relay.session('rs-drop')?.epoch).toBe(0) // same fingerprint: no epoch bump
+        expect((await disconnected).wasAdmitted).toBe(true)
+        await until(() => (admissions === 2 ? true : undefined))
         expect(relay.isLive('rs-drop', 'destination')).toBe(true)
     })
 
@@ -212,7 +192,7 @@ describe('RelayClient against the fake relay', () => {
         const firstAdmitted = once(first, 'admitted')
         first.start()
         await firstAdmitted
-        const displaced = once(first, 'displaced')
+        const displaced = new Promise<void>((resolve) => relay.once('displaced', () => resolve()))
         const second = track(makeClient(relay, identity, 'source', 'rs-displace'))
         const secondAdmitted = once(second, 'admitted')
         second.start()
@@ -220,7 +200,7 @@ describe('RelayClient against the fake relay', () => {
         await displaced
         expect(second.state).toBe('admitted')
         // the displaced client re-dials and takes the slot back — flapping is the caller's problem to avoid
-        await waitFor(() => (first.state === 'admitted' ? true : undefined))
+        await until(() => (first.state === 'admitted' ? true : undefined))
         second.stop()
     })
 
@@ -234,41 +214,35 @@ describe('RelayClient against the fake relay', () => {
         client.on('admitted', () => admissions++)
         const disconnected = once<{ wasAdmitted: boolean }>(client, 'disconnected')
         client.start()
-        await waitFor(() => (admissions === 1 ? true : undefined))
+        await until(() => (admissions === 1 ? true : undefined))
         relay.setPingEnabled(false)
-        const info = await disconnected
-        expect(info.wasAdmitted).toBe(true)
+        expect((await disconnected).wasAdmitted).toBe(true)
         relay.setPingEnabled(true)
-        await waitFor(() => (admissions === 2 ? true : undefined))
+        await until(() => (admissions === 2 ? true : undefined))
     })
 
     it('send() returns false when not admitted and delivers frames when it is', async () => {
         const identity = createIdentity()
         const client = track(makeClient(relay, identity, 'source', 'rs-send'))
-        expect(client.send({ type: 'ACK', header: { messageId: uuidv4() } })).toBe(false)
+        expect(client.send({ type: 'ACK', header: { messageId: randomUUID() } })).toBe(false)
         const admitted = once(client, 'admitted')
         client.start()
         await admitted
-        expect(client.send({ type: 'ACK', header: { messageId: uuidv4() } })).toBe(true)
+        expect(client.send({ type: 'ACK', header: { messageId: randomUUID() } })).toBe(true)
         client.stop()
         expect(client.state).toBe('stopped')
-        expect(client.send({ type: 'ACK', header: { messageId: uuidv4() } })).toBe(false)
-        await waitFor(() => (relay.isLive('rs-send', 'source') ? undefined : true))
+        expect(client.send({ type: 'ACK', header: { messageId: randomUUID() } })).toBe(false)
+        await until(() => (relay.isLive('rs-send', 'source') ? undefined : true))
     })
 
-    it('surfaces malformed frames and pre-admission traffic as protocol errors without crashing', async () => {
+    it('ignores malformed frames from the relay without dropping the socket', async () => {
         const identity = createIdentity()
         const client = track(makeClient(relay, identity, 'source', 'rs-proto'))
-        const errors: string[] = []
-        client.on('protocolError', (e) => errors.push(e.message))
         const admitted = once(client, 'admitted')
         client.start()
         await admitted
-        // reach into the socket to inject garbage as if from the relay
-        const conn = relay.session('rs-proto')!.sockets.source!
-        conn.ws.send(Buffer.from([9, 9, 9]))
-        await waitFor(() => (errors.length ? true : undefined))
-        expect(errors[0]).toMatch(/malformed relay frame/)
+        relay.session('rs-proto')!.sockets.source!.ws.send(Buffer.from([9, 9, 9]))
+        await new Promise((r) => setTimeout(r, 30))
         expect(client.state).toBe('admitted')
     })
 
@@ -298,7 +272,6 @@ describe('RelayClient against the fake relay', () => {
             expectedRemoteStatic: srcId.publicKey,
             prologue,
         })
-
         const received: Record<string, Frame[]> = { source: [], destination: [] }
         source.on('frame', (f) => received.source.push(f))
         destination.on('frame', (f) => received.destination.push(f))
@@ -310,29 +283,26 @@ describe('RelayClient against the fake relay', () => {
         destination.on('frame', (f) => {
             if (f.type === 'HANDSHAKE') dstSession.readHandshake(f.payload)
         })
-
         const bothAdmitted = Promise.all([once(source, 'admitted'), once(destination, 'admitted')])
         source.start()
         destination.start()
         await bothAdmitted
+        await until(() => (source.peerAttached && destination.peerAttached ? true : undefined))
         expect(destination.send({ type: 'HANDSHAKE', header: {}, payload: dstSession.writeHandshake() })).toBe(true)
-        await waitFor(() => (dstSession.complete && srcSession.complete ? true : undefined))
+        await until(() => (dstSession.complete && srcSession.complete ? true : undefined))
         expect(dstSession.epochTag).toBe(srcSession.epochTag)
         expect(received.source.filter((f) => f.type === 'HANDSHAKE')).toHaveLength(1)
         expect(received.destination.filter((f) => f.type === 'HANDSHAKE')).toHaveLength(1)
-        // the relay stored nothing: handshake frames are forwarded, never mailboxed
-        expect(relay.messages('rs-ik', 'dstToSrc')).toHaveLength(0)
-        expect(relay.messages('rs-ik', 'srcToDst')).toHaveLength(0)
     })
 
-    it('drops a HANDSHAKE frame when the peer is not live (the initiator retries)', async () => {
+    it('a HANDSHAKE frame sent while the peer is absent is dropped by the relay', async () => {
         const dstId = createIdentity()
         const destination = track(makeClient(relay, dstId, 'destination', 'rs-lonely'))
         const admitted = once(destination, 'admitted')
         destination.start()
         await admitted
-        const dropped = new Promise<string>((resolve) => relay.once('handshakeDropped', (_s, to) => resolve(to)))
+        const dropped = new Promise<string>((resolve) => relay.once('dropped', (_s, from) => resolve(from)))
         destination.send({ type: 'HANDSHAKE', header: {}, payload: Buffer.alloc(96) })
-        expect(await dropped).toBe('source')
+        expect(await dropped).toBe('destination')
     })
 })

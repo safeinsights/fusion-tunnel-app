@@ -1,36 +1,47 @@
-import { parse as parseUuid, stringify as stringifyUuid, v4 as uuidv4 } from 'uuid'
-import { Exchange, type OutboundMessage, type ExchangeTransport } from '@/lib/exchange'
+import { randomUUID } from 'node:crypto'
+import { parse as parseUuid, stringify as stringifyUuid } from 'uuid'
+import type { Exchange, ExchangeTransport, OutboundMessage } from '@/lib/exchange'
+import type { TerminalDetail } from '@/lib/lifecycle'
 import { log } from '@/lib/logger'
 import { encodeChunkHeader } from '@/lib/noise/chunk-header'
 import { DecryptError, NoiseSession, ReplayError } from '@/lib/noise/session'
+import type { Budget, Role, TerminalCode } from '@/local-api'
 import { CapsMeter, payloadBytes, type CapLimit } from '@/reliability/caps'
-import { declaredSizeFor, splitMessage } from '@/reliability/chunker'
+import { splitMessage } from '@/reliability/chunker'
 import { Inbox } from '@/reliability/inbox'
 import { Outbox } from '@/reliability/outbox'
 import { pad, PaddingError, unpad } from '@/reliability/padding'
-import { openBlob, sealBlob, BlobContentError } from '@/reliability/blob-content'
-import type { BlobClient } from '@/lib/relay/blob-client'
+import type { DataHeader, Frame, NackHeader } from '@/relay-protocol'
 import {
-    ChannelEnvelopeSchema,
     ChannelMessageSchema,
     CHANNEL_MESSAGE_VERSION,
-    type BlobPointer,
+    PAD_BUCKETS,
     type ChannelMessage,
+    type CloseMessage,
 } from '@/schemas/channel'
-import type { Budget, Role } from '@/schemas/local-api'
-import type { DataHeader, Frame, NackDiscardHeader } from '@/schemas/relay-wire'
 
-// Two-stage ACK orchestration and everything between the plaintext Exchange and relay frames
-// (v2 §7.2, §7.3, §7.5, §7.6): pad → chunk → seal under the current epoch → DATA frames; inbound
-// DATA → replay window → open → unpad → reassemble → parse → deliver with dedup. Retransmission
-// re-encrypts from the outbox; duplicates re-ACK; undecryptable frames NACK-discard; the relay's
-// BACKPRESSURE is retried from the outbox and surfaced as a retryable 429 when the local window
-// is full. Source-side caps are metered here on plaintext, before padding and encryption.
+// Everything between the plaintext Exchange and relay frames (v2 §7.2, §7.3, §7.5, §7.6): pad →
+// chunk → seal under the current epoch → DATA frames; inbound DATA → replay window → open → unpad
+// → reassemble → parse → deliver with dedup. The relay stores nothing, so this layer owns
+// retransmission: the outbox is re-offered whenever the peer (re)attaches or the epoch changes, and
+// a retransmit timer re-sends anything unacknowledged for too long. Too many sends without an ACK,
+// or an ACK that never comes, end the leg loudly. Source-side caps are metered here on plaintext,
+// before padding and encryption.
 
 export class BackpressureError extends Error {
     constructor() {
         super('in-flight window is full; retry shortly')
         this.name = 'BackpressureError'
+    }
+}
+
+export class MessageTooLargeError extends Error {
+    constructor(
+        readonly bytes: number,
+        readonly max: number,
+    ) {
+        super(`message plaintext is ${bytes} bytes; the limit is ${max}`)
+        this.name = 'MessageTooLargeError'
     }
 }
 
@@ -44,14 +55,17 @@ export class LimitExceededError extends Error {
         super(`${side} cap ${limit} exceeded (${used} > ${max})`)
         this.name = 'LimitExceededError'
     }
+
+    get detail(): TerminalDetail {
+        return { cap: this.limit, limit: this.max, observed: this.used }
+    }
 }
 
 export type FrameSender = {
     send(frame: Frame): boolean
     readonly connected: boolean
+    readonly peerAttached: boolean
 }
-
-export type ControlKind = 'CLOSE' | 'LIMIT_EXCEEDED'
 
 export type DeliveryEvent =
     | { type: 'sent'; messageId: string; kind: string; chunks: number; epochTag: string; resend: boolean }
@@ -59,35 +73,31 @@ export type DeliveryEvent =
     | { type: 'delivered'; messageId: string; kind: string }
     | { type: 'duplicate'; messageId: string; reacked: boolean }
     | { type: 'nack'; messageId: string; reason: string }
-    | { type: 'backpressure'; messageId: string }
     | { type: 'peer_nack'; messageId: string; reason: string }
-    | { type: 'control'; control: ControlKind; messageId: string }
+    | { type: 'backpressure'; messageId: string }
     | { type: 'limit_exceeded'; side: 'query' | 'response'; limit: CapLimit }
-    | { type: 'blob_uploaded'; messageId: string; blobId: string; bytes: number; reupload: boolean }
-    | { type: 'blob_fetched'; messageId: string; blobId: string; bytes: number }
-    | { type: 'blob_failed'; messageId: string; blobId: string; phase: 'put' | 'get'; status: number }
 
 export type DeliveryOptions = {
     role: Role
     connectionId: string
-    buckets: readonly number[]
     window: { maxMsgs: number; maxBytes: number }
+    maxMessageBytes: number
     inbox: { maxPartialMessages: number; maxPartialBytes: number }
     backpressureRetryMs: number
+    retransmitMs: number
+    maxSends: number
+    unackedMaxMs: number
     exchange: Exchange
     sender: FrameSender
     caps?: CapsMeter
-    /** Blob store client; without one every message travels inline. */
-    blobs?: BlobClient
-    /** Plaintext size above which a message takes the blob path (adopted from ADMITTED when advertised). */
-    inlineCapBytes?: number
-    onControl: (control: ControlKind, messageId: string, reason?: string) => void
     onLimitExceeded: (error: LimitExceededError) => void
-    /** A message can never be delivered (blob store refused it for good): the session cannot continue. */
-    onFatal?: (reason: string) => void
+    /** A message can never be delivered: the session cannot continue. */
+    onFatal: (reason: string) => void
     onEvent?: (event: DeliveryEvent) => void
     now?: () => number
 }
+
+export type VerifiedClose = { messageId: string; code: TerminalCode; reason?: string; limit?: TerminalDetail }
 
 export class Delivery implements ExchangeTransport {
     readonly outbox: Outbox
@@ -96,19 +106,16 @@ export class Delivery implements ExchangeTransport {
     private peerConnectionId: string | undefined
     private readonly pendingAcks = new Set<string>()
     private retryTimer: NodeJS.Timeout | null = null
+    private readonly retransmitTimer: NodeJS.Timeout
     private readonly now: () => number
-    private inlineCapBytes: number
-    /** Pointer messageIds whose blob is being fetched; a redelivered pointer must not fetch twice. */
-    private readonly resolvingBlobs = new Set<string>()
     private stopped = false
 
     constructor(private readonly options: DeliveryOptions) {
         this.now = options.now ?? Date.now
         this.outbox = new Outbox(options.window, this.now)
         this.inbox = new Inbox(options.inbox, this.now)
-        this.inlineCapBytes = options.blobs
-            ? (options.inlineCapBytes ?? Number.POSITIVE_INFINITY)
-            : Number.POSITIVE_INFINITY
+        this.retransmitTimer = setInterval(() => this.retransmit(), options.retransmitMs)
+        this.retransmitTimer.unref()
     }
 
     // ---- session lifecycle ---------------------------------------------------------------
@@ -122,12 +129,8 @@ export class Delivery implements ExchangeTransport {
         if (session) this.flush()
     }
 
-    /** The relay re-admitted us: adopt its limits, re-offer un-ACKed sends (it appends idempotently) and pending ACKs. */
-    onReconnected(limits?: { maxMsgs: number; maxBytes: number; inlineCapBytes?: number }): void {
-        if (limits) {
-            this.outbox.setLimits({ maxMsgs: limits.maxMsgs, maxBytes: limits.maxBytes })
-            if (limits.inlineCapBytes !== undefined && this.options.blobs) this.inlineCapBytes = limits.inlineCapBytes
-        }
+    /** The relay re-admitted us, or the peer came back: re-offer everything un-ACKed and any pending ACKs. */
+    reoffer(): void {
         this.outbox.invalidateSent()
         this.flush()
     }
@@ -138,6 +141,7 @@ export class Delivery implements ExchangeTransport {
 
     stop(): void {
         this.stopped = true
+        clearInterval(this.retransmitTimer)
         if (this.retryTimer) clearTimeout(this.retryTimer)
         this.retryTimer = null
     }
@@ -161,6 +165,7 @@ export class Delivery implements ExchangeTransport {
                 const verdict = this.options.caps.checkResponse(bytes)
                 if (!verdict.ok) {
                     const error = new LimitExceededError('response', verdict.limit, verdict.used, verdict.max)
+                    this.emit({ type: 'limit_exceeded', side: 'response', limit: verdict.limit })
                     this.options.onLimitExceeded(error)
                     throw error
                 }
@@ -175,23 +180,21 @@ export class Delivery implements ExchangeTransport {
                 ...(budget ? { budget } : {}),
             }
         }
-        const respondsTo =
-            message.kind === 'response' ? this.options.exchange.latestQueryMessageId(message.correlationId) : undefined
-        this.enqueue(message.messageId, message.kind, channelMessage, message.correlationId, respondsTo)
-    }
-
-    /** Authenticated control message through the channel, same reliability as any message. */
-    sendControl(control: ControlKind, reason?: string): string {
-        const messageId = uuidv4()
-        const channelMessage: ChannelMessage = {
-            v: CHANNEL_MESSAGE_VERSION,
-            kind: 'control',
-            control,
-            ...(reason ? { reason } : {}),
-            ...(this.options.caps ? { budget: this.options.caps.budget() } : {}),
+        const plaintext = Buffer.from(JSON.stringify(channelMessage), 'utf8')
+        if (plaintext.byteLength > this.options.maxMessageBytes) {
+            throw new MessageTooLargeError(plaintext.byteLength, this.options.maxMessageBytes)
         }
-        this.enqueue(messageId, 'control', channelMessage)
-        return messageId
+        if (
+            !this.outbox.add({
+                messageId: message.messageId,
+                kind: message.kind,
+                correlationId: message.correlationId,
+                plaintext,
+            })
+        ) {
+            throw new BackpressureError()
+        }
+        this.flush()
     }
 
     ack(messageId: string): void {
@@ -202,139 +205,25 @@ export class Delivery implements ExchangeTransport {
         return this.outbox.has(messageId)
     }
 
-    private enqueue(
-        messageId: string,
-        kind: OutboundMessage['kind'] | 'control',
-        channelMessage: ChannelMessage,
-        correlationId?: string,
-        respondsTo?: string,
-    ): void {
-        const plaintext = Buffer.from(JSON.stringify(channelMessage), 'utf8')
-        if (plaintext.byteLength > this.inlineCapBytes && kind !== 'control' && this.options.blobs) {
-            return this.enqueueBlob(messageId, kind, plaintext, correlationId, respondsTo)
-        }
-        const sizeBytes = declaredSizeFor(plaintext.byteLength, this.options.buckets)
-        if (
-            !this.outbox.add({
-                messageId,
-                kind,
-                correlationId,
-                plaintext,
-                sizeBytes,
-                wireSizeBytes: sizeBytes,
-                respondsTo,
-            })
-        ) {
-            throw new BackpressureError()
-        }
-        this.flush()
-    }
-
-    /**
-     * Blob path (v2 §7.2): seal the whole channel message under a fresh content key, keep the sealed
-     * blob in the outbox until ACK (so a purged blob can be re-uploaded), send the pointer through the
-     * mailbox once the upload lands. Local window accounting counts the blob; the relay's counts the pointer.
-     */
-    private enqueueBlob(
-        messageId: string,
-        kind: OutboundMessage['kind'],
-        plaintext: Buffer,
-        correlationId?: string,
-        respondsTo?: string,
-    ): void {
-        const blobId = uuidv4()
-        const sealed = sealBlob(plaintext, blobId)
-        const pointer: BlobPointer = {
-            v: CHANNEL_MESSAGE_VERSION,
-            kind: 'blob-pointer',
-            blobId,
-            contentKey: sealed.contentKey.toString('base64url'),
-            size: sealed.ciphertext.byteLength,
-            sha256: sealed.sha256.toString('base64url'),
-        }
-        const pointerBytes = Buffer.from(JSON.stringify(pointer), 'utf8')
-        const wireSizeBytes = declaredSizeFor(pointerBytes.byteLength, this.options.buckets)
-        const added = this.outbox.add({
-            messageId,
-            kind,
-            correlationId,
-            plaintext: pointerBytes,
-            sizeBytes: wireSizeBytes + sealed.ciphertext.byteLength,
-            wireSizeBytes,
-            respondsTo,
-            blob: { blobId, ciphertext: sealed.ciphertext, uploaded: false, uploading: false, attempts: 0 },
-        })
-        if (!added) throw new BackpressureError()
-        log.info('channel.blob_path', {
-            messageId,
-            blobId,
-            plaintextBytes: plaintext.byteLength,
-            blobBytes: sealed.ciphertext.byteLength,
-        })
-        void this.uploadBlob(messageId)
-    }
-
-    private async uploadBlob(messageId: string): Promise<void> {
-        const entry = this.outbox.get(messageId)
-        const blobs = this.options.blobs
-        if (!entry?.blob || !blobs || entry.blob.uploading || entry.blob.uploaded || this.stopped) return
-        entry.blob.uploading = true
-        entry.blob.attempts++
-        const reupload = entry.blob.attempts > 1
-        const result = await blobs.put(entry.blob.blobId, entry.blob.ciphertext)
-        entry.blob.uploading = false
-        if (this.stopped || !this.outbox.has(messageId)) return
-        if (result.ok) {
-            entry.blob.uploaded = true
-            this.emit({
-                type: 'blob_uploaded',
-                messageId,
-                blobId: entry.blob.blobId,
-                bytes: result.sizeBytes,
-                reupload,
-            })
-            log.info('channel.blob_uploaded', {
-                messageId,
-                blobId: entry.blob.blobId,
-                bytes: result.sizeBytes,
-                reupload,
-            })
-            this.flush()
-            return
-        }
-        this.emit({ type: 'blob_failed', messageId, blobId: entry.blob.blobId, phase: 'put', status: result.status })
-        if (result.retryable) {
-            // The client already retried transient failures; re-offer later (e.g. after a reconnect).
-            log.warn('channel.blob_upload_deferred', { messageId, blobId: entry.blob.blobId, status: result.status })
-            this.scheduleRetry()
-            return
-        }
-        log.error('channel.blob_upload_rejected', {
-            messageId,
-            blobId: entry.blob.blobId,
-            status: result.status,
-            code: result.code,
-        })
-        this.options.onFatal?.(`blob upload rejected (${result.code ?? result.status})`)
-    }
-
     // ---- authenticated CLOSE (v2 §7.6) --------------------------------------------------
 
     /**
-     * The CLOSE frame's payload: `messageId(16) ‖ transport frame` carrying a control CLOSE sealed
-     * under the current epoch, so the peer can trust that the study really ended. Undefined when no
-     * channel is established (the relay still purges; the peer then ends on SESSION_CLOSED).
+     * The CLOSE frame's payload: `messageId(16) ‖ transport frame` carrying a control CLOSE with the
+     * terminal code, sealed under the current epoch, so the peer can trust how the study ended.
+     * Undefined when no channel is established (the relay still purges; the peer then ends ERRORED).
      */
-    sealClose(reason?: string): Buffer | undefined {
+    sealClose(code: TerminalCode, reason?: string, limit?: TerminalDetail): Buffer | undefined {
         const session = this.session
         if (!session?.complete) return undefined
-        const messageId = uuidv4()
-        const message: ChannelMessage = {
+        const messageId = randomUUID()
+        const message: CloseMessage = {
             v: CHANNEL_MESSAGE_VERSION,
             kind: 'control',
             control: 'CLOSE',
+            code,
             ...(reason ? { reason: reason.slice(0, 256) } : {}),
             ...(this.options.caps ? { budget: this.options.caps.budget() } : {}),
+            ...(limit ? { limit } : {}),
         }
         const aad = encodeChunkHeader({
             messageId,
@@ -342,12 +231,12 @@ export class Delivery implements ExchangeTransport {
             chunkCount: 1,
             senderConnectionId: this.options.connectionId,
         })
-        const frame = session.encrypt(pad(Buffer.from(JSON.stringify(message), 'utf8'), this.options.buckets), aad)
+        const frame = session.encrypt(pad(Buffer.from(JSON.stringify(message), 'utf8'), PAD_BUCKETS), aad)
         return Buffer.concat([Buffer.from(parseUuid(messageId)), frame])
     }
 
     /** Verify a peer's CLOSE payload; undefined when it cannot be authenticated (logged, not trusted). */
-    openClose(payload: Buffer): { messageId: string; reason?: string } | undefined {
+    openClose(payload: Buffer): VerifiedClose | undefined {
         const session = this.session
         if (!session?.complete || !this.peerConnectionId || payload.byteLength < 16) return undefined
         let messageId: string
@@ -365,8 +254,9 @@ export class Delivery implements ExchangeTransport {
         try {
             const plaintext = unpad(session.decrypt(payload.subarray(16), aad))
             const parsed = ChannelMessageSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
-            if (!parsed.success || parsed.data.kind !== 'control' || parsed.data.control !== 'CLOSE') return undefined
-            return { messageId, ...(parsed.data.reason ? { reason: parsed.data.reason } : {}) }
+            if (!parsed.success || parsed.data.kind !== 'control') return undefined
+            const { code, reason, limit } = parsed.data
+            return { messageId, code, ...(reason ? { reason } : {}), ...(limit ? { limit } : {}) }
         } catch {
             return undefined
         }
@@ -374,42 +264,32 @@ export class Delivery implements ExchangeTransport {
 
     // ---- outbound frames -----------------------------------------------------------------
 
-    /** Seal and send every outbox entry not yet sent under the current epoch, in FIFO order. */
+    /** Seal and send every outbox entry not yet sent under the current epoch, in FIFO order — only when the peer can hear us. */
     flush(): void {
         const session = this.session
-        if (!session?.complete || !this.options.sender.connected) return
+        const { sender } = this.options
+        if (!session?.complete || !sender.connected || !sender.peerAttached) return
         const epochTag = session.epochTag!
         for (const messageId of this.pendingAcks) {
-            if (!this.options.sender.send({ type: 'ACK', header: { messageId } })) return
+            if (!sender.send({ type: 'ACK', header: { messageId } })) return
             this.pendingAcks.delete(messageId)
         }
         for (const entry of this.outbox.pendingFor(epochTag)) {
-            if (entry.blob && !entry.blob.uploaded) {
-                if (!entry.blob.uploading) void this.uploadBlob(entry.messageId)
-                continue
-            }
-            const chunks = splitMessage(entry.plaintext, this.options.buckets)
-            const frames: Frame[] = chunks.map((chunk, chunkIndex) => {
+            const chunks = splitMessage(entry.plaintext, PAD_BUCKETS)
+            for (const [chunkIndex, chunk] of chunks.entries()) {
                 const aad = encodeChunkHeader({
                     messageId: entry.messageId,
                     chunkIndex,
                     chunkCount: chunks.length,
                     senderConnectionId: this.options.connectionId,
                 })
-                return {
+                const frame: Frame = {
                     type: 'DATA',
-                    header: {
-                        messageId: entry.messageId,
-                        chunkIndex,
-                        chunkCount: chunks.length,
-                        epochTag,
-                        ...(entry.respondsTo ? { respondsTo: entry.respondsTo } : {}),
-                        sizeBytes: entry.wireSizeBytes,
-                    },
-                    payload: session.encrypt(pad(chunk, this.options.buckets), aad),
+                    header: { messageId: entry.messageId, chunkIndex, chunkCount: chunks.length },
+                    payload: session.encrypt(pad(chunk, PAD_BUCKETS), aad),
                 }
-            })
-            for (const frame of frames) if (!this.options.sender.send(frame)) return
+                if (!sender.send(frame)) return
+            }
             const resend = entry.sends > 0
             this.outbox.markSent(entry.messageId, epochTag)
             this.emit({
@@ -425,12 +305,30 @@ export class Delivery implements ExchangeTransport {
                 kind: entry.kind,
                 correlationId: entry.correlationId,
                 chunks: chunks.length,
-                sizeBytes: entry.wireSizeBytes,
-                blob: entry.blob !== undefined,
                 epochTag,
                 resend,
             })
         }
+    }
+
+    /** Timer tick: re-offer what has waited too long for its ACK; give up loudly past the bounds. */
+    private retransmit(): void {
+        const epochTag = this.session?.epochTag
+        if (this.stopped || !epochTag) return
+        const now = this.now()
+        for (const entry of this.outbox.staleSince(epochTag, now - this.options.retransmitMs)) {
+            if (entry.sends >= this.options.maxSends || now - entry.createdAt > this.options.unackedMaxMs) {
+                log.error('channel.message_unacknowledged', {
+                    messageId: entry.messageId,
+                    sends: entry.sends,
+                    ageMs: now - entry.createdAt,
+                })
+                this.options.onFatal(`message ${entry.messageId} unacknowledged after ${entry.sends} sends`)
+                return
+            }
+            this.outbox.resetSent(entry.messageId)
+        }
+        this.flush()
     }
 
     // ---- inbound frames ------------------------------------------------------------------
@@ -445,13 +343,16 @@ export class Delivery implements ExchangeTransport {
                     log.info('channel.message_acked', { messageId: frame.header.messageId })
                 }
                 return
-            case 'NACK_DISCARD':
+            case 'NACK':
                 return this.onPeerNack(frame.header)
             case 'ERROR':
-                if (frame.header.code === 'BACKPRESSURE' && frame.header.messageId) {
+                if (
+                    (frame.header.code === 'BACKPRESSURE' || frame.header.code === 'RATE_LIMITED') &&
+                    frame.header.messageId
+                ) {
                     this.outbox.resetSent(frame.header.messageId)
                     this.emit({ type: 'backpressure', messageId: frame.header.messageId })
-                    log.warn('channel.backpressure', { messageId: frame.header.messageId })
+                    log.warn('channel.backpressure', { code: frame.header.code, messageId: frame.header.messageId })
                     this.scheduleRetry()
                 } else {
                     log.warn('channel.relay_error', { code: frame.header.code, retryable: frame.header.retryable })
@@ -462,21 +363,14 @@ export class Delivery implements ExchangeTransport {
         }
     }
 
-    private onPeerNack(header: NackDiscardHeader): void {
-        // The peer could not decrypt our frame. Across an epoch change the relay purge plus our
-        // re-send under the new epoch already cover it; within an epoch, re-offer it once.
+    private onPeerNack(header: NackHeader): void {
+        // The peer could not decrypt our frame. Across an epoch change the re-send under the new
+        // epoch already covers it; within an epoch, re-offer it a few times, then let the retransmit
+        // bound end the leg.
         this.emit({ type: 'peer_nack', messageId: header.messageId, reason: header.reason })
         log.warn('channel.peer_nack', { messageId: header.messageId, reason: header.reason })
         const entry = this.outbox.get(header.messageId)
-        if (!entry) return
-        if (entry.blob && header.reason === 'blob_missing') {
-            // The relay no longer holds the blob (purged or lost): upload it again, then re-send the pointer.
-            entry.blob.uploaded = false
-            this.outbox.resetSent(header.messageId)
-            void this.uploadBlob(header.messageId)
-            return
-        }
-        if (entry.sends < 3) {
+        if (entry && entry.sends < 3) {
             this.outbox.resetSent(header.messageId)
             this.scheduleRetry()
         }
@@ -485,8 +379,6 @@ export class Delivery implements ExchangeTransport {
     private onData(header: DataHeader, payload: Buffer): void {
         const session = this.session
         if (!session?.complete || !this.peerConnectionId) return this.nack(header.messageId, 'stale_epoch')
-        if (header.epochTag !== session.epochTag) return this.nack(header.messageId, 'stale_epoch')
-
         const aad = encodeChunkHeader({
             messageId: header.messageId,
             chunkIndex: header.chunkIndex,
@@ -508,7 +400,7 @@ export class Delivery implements ExchangeTransport {
             if (error instanceof PaddingError) return this.nack(header.messageId, 'malformed')
             throw error
         }
-        const result = this.inbox.accept(header.messageId, header.chunkIndex, header.chunkCount, header.epochTag, data)
+        const result = this.inbox.accept(header.messageId, header.chunkIndex, header.chunkCount, data)
         switch (result.status) {
             case 'partial':
             case 'duplicate_chunk':
@@ -521,7 +413,7 @@ export class Delivery implements ExchangeTransport {
         }
     }
 
-    /** A byte-identical redelivery: re-ACK if the RC already consumed it, otherwise let it ride. */
+    /** A byte-identical redelivery: re-ACK if the RC already has it, otherwise let it ride. */
     private onDuplicateFrame(messageId: string): void {
         const reacked = this.options.exchange.isConsumed(messageId)
         if (reacked) this.ack(messageId)
@@ -529,73 +421,16 @@ export class Delivery implements ExchangeTransport {
     }
 
     private onMessage(messageId: string, plaintext: Buffer): void {
-        let envelope: ChannelMessage | BlobPointer
+        let parsed: ChannelMessage
         try {
-            const result = ChannelEnvelopeSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
+            const result = ChannelMessageSchema.safeParse(JSON.parse(plaintext.toString('utf8')))
             if (!result.success) return this.nack(messageId, 'malformed')
-            envelope = result.data
+            parsed = result.data
         } catch {
             return this.nack(messageId, 'malformed')
         }
-        if (envelope.kind === 'blob-pointer') {
-            if (this.resolvingBlobs.has(messageId)) return
-            void this.resolveBlob(messageId, envelope)
-            return
-        }
-        this.onChannelMessage(messageId, envelope)
-    }
-
-    /** Receiver side of the blob path: GET, open under the pointer's key, then treat as an inline message. */
-    private async resolveBlob(messageId: string, pointer: BlobPointer): Promise<void> {
-        const blobs = this.options.blobs
-        if (!blobs) return this.nack(messageId, 'malformed')
-        this.resolvingBlobs.add(messageId)
-        try {
-            const result = await blobs.get(pointer.blobId)
-            if (this.stopped) return
-            if (!result.ok) {
-                this.emit({
-                    type: 'blob_failed',
-                    messageId,
-                    blobId: pointer.blobId,
-                    phase: 'get',
-                    status: result.status,
-                })
-                return this.nack(messageId, result.notFound ? 'blob_missing' : 'blob_unavailable')
-            }
-            if (result.bytes.byteLength !== pointer.size) return this.nack(messageId, 'malformed')
-            let inner: Buffer
-            try {
-                inner = openBlob(
-                    result.bytes,
-                    Buffer.from(pointer.contentKey, 'base64url'),
-                    pointer.blobId,
-                    Buffer.from(pointer.sha256, 'base64url'),
-                )
-            } catch (error) {
-                if (error instanceof BlobContentError) return this.nack(messageId, 'undecryptable')
-                throw error
-            }
-            const parsed = ChannelMessageSchema.safeParse(JSON.parse(inner.toString('utf8')))
-            if (!parsed.success || parsed.data.kind === 'control') return this.nack(messageId, 'malformed')
-            this.emit({ type: 'blob_fetched', messageId, blobId: pointer.blobId, bytes: result.bytes.byteLength })
-            log.info('channel.blob_fetched', { messageId, blobId: pointer.blobId, bytes: result.bytes.byteLength })
-            this.onChannelMessage(messageId, parsed.data)
-        } catch {
-            this.nack(messageId, 'malformed')
-        } finally {
-            this.resolvingBlobs.delete(messageId)
-        }
-    }
-
-    private onChannelMessage(messageId: string, parsed: ChannelMessage): void {
-        if (parsed.kind === 'control') {
-            this.ack(messageId)
-            this.emit({ type: 'control', control: parsed.control, messageId })
-            log.info('channel.control_received', { messageId, control: parsed.control })
-            this.options.onControl(parsed.control, messageId, parsed.reason)
-            return
-        }
+        // CLOSE rides its own frame, never a DATA message.
+        if (parsed.kind === 'control') return this.nack(messageId, 'malformed')
 
         if (parsed.kind === 'query' && this.options.caps) {
             // Query-side caps (hub memo §2.3): metered on the decrypted plaintext before delivery.
@@ -608,7 +443,6 @@ export class Delivery implements ExchangeTransport {
                 return
             }
         }
-
         const outcome = this.options.exchange.deliver({
             kind: parsed.kind,
             messageId,
@@ -641,11 +475,11 @@ export class Delivery implements ExchangeTransport {
     private nack(messageId: string, reason: string): void {
         this.emit({ type: 'nack', messageId, reason })
         log.warn('channel.nack_discard', { messageId, reason })
-        this.options.sender.send({ type: 'NACK_DISCARD', header: { messageId, reason } })
+        this.options.sender.send({ type: 'NACK', header: { messageId, reason } })
     }
 
     private scheduleRetry(): void {
-        if (this.retryTimer) return
+        if (this.retryTimer || this.stopped) return
         this.retryTimer = setTimeout(() => {
             this.retryTimer = null
             this.flush()
@@ -657,12 +491,7 @@ export class Delivery implements ExchangeTransport {
         this.options.onEvent?.(event)
     }
 
-    stats(): { outboxDepth: number; outboxBytes: number; inboxPartials: number; pendingAcks: number } {
-        return {
-            outboxDepth: this.outbox.depth,
-            outboxBytes: this.outbox.bytesQueued,
-            inboxPartials: this.inbox.partialCount,
-            pendingAcks: this.pendingAcks.size,
-        }
+    stats(): { outboxDepth: number; pendingAcks: number } {
+        return { outboxDepth: this.outbox.depth, pendingAcks: this.pendingAcks.size }
     }
 }

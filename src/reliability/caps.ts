@@ -1,4 +1,4 @@
-import type { Budget } from '@/schemas/local-api'
+import type { Budget } from '@/local-api'
 import type { Caps, CapsConsumed } from '@/schemas/provisioning'
 
 // Source-enforced per-study caps (security review §7.3; hub memo §2.3; plan §10). The source

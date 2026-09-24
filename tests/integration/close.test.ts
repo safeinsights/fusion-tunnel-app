@@ -1,19 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { startPair, runRound, until, type Pair } from '@/testing/pair-harness'
+import { startPair, runRound, until, poll200, type Pair } from '@/testing/pair-harness'
 import { installExitPolicy } from '@/lib/exit'
-import type { ApiResult } from '@/testing/fixtures'
 
 const T = 30_000
-
-const poll200 = (call: () => Promise<ApiResult>, label: string, timeoutMs = 8000) =>
-    until(
-        async () => {
-            const res = await call()
-            return res.status === 200 ? res.body : undefined
-        },
-        timeoutMs,
-        label,
-    )
 
 /** Fake process exits for both sides; resolves with [sourceCode, destinationCode]. */
 const armExits = (pair: Pair, graceMs = 10) => {
@@ -39,20 +28,13 @@ describe('close and failure flows', () => {
         await pair?.close().catch(() => undefined)
     })
 
-    it('completes: authenticated CLOSE, STUDY_COMPLETE at the source, purge, both exit 0', { timeout: T }, async () => {
-        pair = await startPair({
-            env: { FUSION_INLINE_CAP_BYTES: '512' },
-            relayOptions: { limits: { inlineCapBytes: 512 } },
-        })
+    it('completes: authenticated CLOSE carrying STUDY_COMPLETE, purge, both exit 0', { timeout: T }, async () => {
+        pair = await startPair()
         await pair.connect()
-        await runRound(pair, { q: 'x'.repeat(2000) }, () => ({ a: 1 })) // leaves a blob behind to be purged
-        expect(pair.relay.blobs(pair.relaySessionId)).toHaveLength(1)
+        await runRound(pair, { q: 1 }, () => ({ a: 1 }))
         const bothExited = armExits(pair)
-        const closeSeen = new Promise<string>((resolve) =>
-            pair.source.tunnel.channel!.once(
-                'control',
-                (control, messageId) => control === 'CLOSE' && resolve(messageId),
-            ),
+        const closeSeen = new Promise<{ code: string; messageId: string }>((resolve) =>
+            pair.source.tunnel.channel!.once('peerClose', resolve),
         )
         const acked = new Promise<void>((resolve) =>
             pair.destination.tunnel.channel!.once('closeAcked', () => resolve()),
@@ -61,19 +43,18 @@ describe('close and failure flows', () => {
         const completed = await pair.dstApi().post('/v1/complete')
         expect(completed.status).toBe(202)
         expect(completed.body).toEqual({ state: 'CLOSING' })
-        expect(await closeSeen).toMatch(/^[0-9a-f-]{36}$/) // a verified, messageId-bearing CLOSE, not a relay signal
+        const close = await closeSeen
+        expect(close.code).toBe('STUDY_COMPLETE')
+        expect(close.messageId).toMatch(/^[0-9a-f-]{36}$/) // a verified, messageId-bearing CLOSE, not a relay signal
         const srcPoll = await pair.srcApi().get('/v1/messages/next')
         expect(srcPoll.status).toBe(200)
-        expect(srcPoll.body).toEqual({ terminal: true, code: 'STUDY_COMPLETE' })
+        expect(srcPoll.body).toMatchObject({ terminal: true, code: 'STUDY_COMPLETE' })
         await acked
 
         expect(await bothExited()).toEqual([0, 0])
         expect(pair.source.tunnel.lifecycle.state).toBe('CLOSED')
         expect(pair.destination.tunnel.lifecycle.state).toBe('CLOSED')
-        const session = pair.relay.session(pair.relaySessionId)!
-        expect(session.status).toBe('closed')
-        expect(pair.relay.messages(pair.relaySessionId, 'dstToSrc')).toHaveLength(0)
-        expect(pair.relay.blobs(pair.relaySessionId)).toHaveLength(0)
+        expect(pair.relay.session(pair.relaySessionId)!.status).toBe('closed')
         expect(pair.destination.tunnel.lifecycle.history.map((t) => t.to).slice(-2)).toEqual(['CLOSING', 'CLOSED'])
     })
 
@@ -118,47 +99,34 @@ describe('close and failure flows', () => {
         },
     )
 
-    it(
-        'a dead-lettered message errors the session on both sides: typed terminal errors and exit 1',
-        { timeout: T },
-        async () => {
-            pair = await startPair({ relayOptions: { maxDeliveries: 2 } })
-            await pair.connect()
-            // a long grace keeps the local APIs up so the terminal bodies can be observed before exit
-            const bothExited = armExits(pair, 1500)
-            const deadLettered = new Promise<string>((resolve) =>
-                pair.relay.once('deadLetter', (_s, id) => resolve(id)),
-            )
-            const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { poison: true } })).body
-            // the source RC never acks; every re-attach redelivers the query until the relay gives up
-            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'first delivery')
-            pair.relay.dropSocket(pair.relaySessionId, 'source')
-            await until(
-                () => (pair.relay.isLive(pair.relaySessionId, 'source') ? true : undefined),
-                5000,
-                're-attach 1',
-            )
-            pair.relay.dropSocket(pair.relaySessionId, 'source')
-            await deadLettered
-            await until(
-                () =>
-                    pair.source.tunnel.lifecycle.state === 'ERRORED' &&
-                    pair.destination.tunnel.lifecycle.state === 'ERRORED'
-                        ? true
-                        : undefined,
-                5000,
-                'both errored',
-            )
-            expect(pair.source.tunnel.lifecycle.history.at(-1)?.reason).toContain('SESSION_ERRORED_DEAD_LETTER')
-            const dstPoll = await pair.dstApi().get(`/v1/responses/${correlationId}`)
-            expect(dstPoll.body).toEqual({ terminal: true, code: 'SESSION_ERRORED' })
-            expect((await pair.srcApi().get('/v1/messages/next')).body).toEqual({
-                terminal: true,
-                code: 'SESSION_ERRORED',
-            })
-            expect(await bothExited()).toEqual([1, 1])
-        },
-    )
+    it('a message the peer never acknowledges ends the leg loudly on both sides: exit 1', { timeout: T }, async () => {
+        pair = await startPair({ env: { FUSION_RETRANSMIT_MS: '100', FUSION_MAX_SENDS: '3' } })
+        await pair.connect()
+        const bothExited = armExits(pair, 1500)
+        pair.relay.dropNext('source', 'ACK', 10) // the source's end-to-end ACKs never reach the destination
+        const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { poison: true } })).body
+        await poll200(() => pair.srcApi().get('/v1/messages/next'), 'first delivery')
+        await until(
+            () =>
+                pair.source.tunnel.lifecycle.state === 'ERRORED' &&
+                pair.destination.tunnel.lifecycle.state === 'ERRORED'
+                    ? true
+                    : undefined,
+            8000,
+            'both errored',
+        )
+        expect(pair.destination.tunnel.lifecycle.history.at(-1)?.reason).toMatch(/unacknowledged after 3 sends/)
+        expect(pair.source.tunnel.lifecycle.history.at(-1)?.reason).toMatch(/peer CLOSE received/)
+        expect((await pair.dstApi().get(`/v1/responses/${correlationId}`)).body).toMatchObject({
+            terminal: true,
+            code: 'SESSION_ERRORED',
+        })
+        expect((await pair.srcApi().get('/v1/messages/next')).body).toMatchObject({
+            terminal: true,
+            code: 'SESSION_ERRORED',
+        })
+        expect(await bothExited()).toEqual([1, 1])
+    })
 
     it(
         'a relay ending the session without an authenticated CLOSE errors both sides: exit 1, never STUDY_COMPLETE',
@@ -187,11 +155,11 @@ describe('close and failure flows', () => {
                 expect(last.reason).toMatch(/without an authenticated CLOSE/)
                 expect(side.tunnel.lifecycle.history.map((t) => t.to)).not.toContain('CLOSING')
             }
-            expect((await pair.dstApi().get(`/v1/responses/${correlationId}`)).body).toEqual({
+            expect((await pair.dstApi().get(`/v1/responses/${correlationId}`)).body).toMatchObject({
                 terminal: true,
                 code: 'SESSION_ERRORED',
             })
-            expect((await pair.srcApi().get('/v1/messages/next')).body).toEqual({
+            expect((await pair.srcApi().get('/v1/messages/next')).body).toMatchObject({
                 terminal: true,
                 code: 'SESSION_ERRORED',
             })
@@ -200,84 +168,72 @@ describe('close and failure flows', () => {
     )
 
     it(
-        'a cap breach closes the relay session too: both exit 2, nothing lingers in the relay',
+        'a cap breach travels as an authenticated LIMIT_EXCEEDED close: both exit 2 and the relay purges',
         { timeout: T },
         async () => {
             pair = await startPair({ sourceBundle: { caps: { maxRounds: 1 } } })
             await pair.connect()
             await runRound(pair, { q: 1 }, () => ({ a: 1 }))
             const bothExited = armExits(pair)
+            const closeSeen = new Promise<{ code: string; limit?: { cap: string } }>((resolve) =>
+                pair.destination.tunnel.channel!.once('peerClose', resolve),
+            )
             const purged = new Promise<void>((resolve) =>
                 pair.relay.on('close', (_s, phase) => phase === 'purged' && resolve()),
             )
             await pair.dstApi().post('/v1/request', { payload: { q: 2 } })
+            expect(await closeSeen).toMatchObject({
+                code: 'LIMIT_EXCEEDED',
+                limit: { cap: 'maxRounds', limit: 1, observed: 2 },
+            })
             expect(await bothExited()).toEqual([2, 2])
             await purged
             expect(pair.relay.session(pair.relaySessionId)!.status).toBe('closed')
-            expect(pair.relay.messages(pair.relaySessionId, 'dstToSrc')).toHaveLength(0)
+            expect(pair.destination.tunnel.lifecycle.terminalDetail()).toEqual({
+                cap: 'maxRounds',
+                limit: 1,
+                observed: 2,
+            })
         },
     )
 
     it(
-        'a cap breach sends CLOSE only after the peer ACKed the LIMIT_EXCEEDED notice (mailbox before frame)',
-        { timeout: T },
-        async () => {
-            pair = await startPair({ sourceBundle: { caps: { maxRounds: 1 } } })
-            await pair.connect()
-            await runRound(pair, { q: 1 }, () => ({ a: 1 }))
-            // The notice is a srcToDst mailbox message; the CLOSE is a frame the relay forwards at once. A
-            // real relay with a slow store can deliver the CLOSE first, so the source must wait for the
-            // notice's ACK before it closes — observed here as the relay seeing that ACK before the CLOSE.
-            const noticeIds = new Set<string>()
-            const order: string[] = []
-            pair.relay.on('data', (_s, direction, messageId) => direction === 'srcToDst' && noticeIds.add(messageId))
-            pair.relay.on('ack', (_s, messageId) => noticeIds.has(messageId) && order.push('notice-acked'))
-            pair.relay.on('close', (_s, phase) => phase === 'requested' && order.push('close-requested'))
-            const bothExited = armExits(pair)
-            await pair.dstApi().post('/v1/request', { payload: { q: 2 } })
-            expect(await bothExited()).toEqual([2, 2])
-            expect(order.slice(0, 2)).toEqual(['notice-acked', 'close-requested'])
-        },
-    )
-
-    it(
-        'a source RC that dies after acking gets the re-issued query again and the round completes',
+        'a source RC that dies after receiving a query sees it again on its next poll, and the round completes',
         { timeout: T },
         async () => {
             pair = await startPair()
             await pair.connect()
             const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 'crash' } })).body
             const first = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'first delivery')
-            await pair.srcApi().post(`/v1/messages/${first.messageId}/ack`)
-            // …the RC crashes here. The relay retains the consumed query and redelivers nothing.
-            await until(() =>
-                pair.relay.messages(pair.relaySessionId, 'dstToSrc')[0]?.msgState === 'consumed' ? true : undefined,
-            )
+            // …the RC crashes here. The destination's outbox let go (the query was acknowledged end to end).
             await until(() => (pair.destination.tunnel.channel!.delivery.stats().outboxDepth === 0 ? true : undefined))
-            expect((await pair.srcApi().get('/v1/messages/next')).status).toBe(204)
-
-            // the destination SDK's round timeout re-issues the same correlationId: the query has left the
-            // outbox unanswered, so the tunnel resends it under a fresh messageId (v2 §7.3, §8 row 3)
+            // A restarted RC polls again and is offered the unanswered query without any destination re-issue.
+            const second = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'offered again')
+            expect(second.messageId).toBe(first.messageId)
+            expect(second.payload).toEqual({ q: 'crash' })
+            // The destination SDK's round timeout may still re-issue the same correlationId: the tunnel resends
+            // it under a fresh messageId and the source retires the earlier copy (v2 §7.3, §8 row 3).
             const reissued = await pair.dstApi().post('/v1/request', { payload: { q: 'crash' }, correlationId })
             expect(reissued.body).toEqual({ correlationId, reissued: true })
-            const second = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'redelivery to the restarted RC')
-            expect(second.correlationId).toBe(correlationId)
-            expect(second.messageId).not.toBe(first.messageId)
-            expect(second.payload).toEqual({ q: 'crash' })
-            await pair.srcApi().post(`/v1/messages/${second.messageId}/ack`)
+            const third = await until(
+                async () => {
+                    const res = await pair.srcApi().get('/v1/messages/next')
+                    return res.status === 200 && res.body.messageId !== first.messageId ? res.body : undefined
+                },
+                5000,
+                'redelivery under a new id',
+            )
+            expect(third.correlationId).toBe(correlationId)
             await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 'recovered' } })
             const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
             expect(response.payload).toEqual({ a: 'recovered' })
-            await pair.dstApi().post(`/v1/messages/${response.messageId}/ack`)
-            // the response released the query it cites; the earlier retained copy is purged at close
-            await until(() => (pair.relay.messages(pair.relaySessionId, 'dstToSrc').length <= 1 ? true : undefined))
+            expect((await pair.srcApi().get('/v1/messages/next')).status).toBe(204)
             await pair.dstApi().post('/v1/complete')
             await until(
                 () => (pair.relay.session(pair.relaySessionId)!.status === 'closed' ? true : undefined),
                 10_000,
                 'purge',
             )
-            expect(pair.relay.messages(pair.relaySessionId, 'dstToSrc')).toHaveLength(0)
         },
     )
 })

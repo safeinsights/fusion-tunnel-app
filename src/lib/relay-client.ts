@@ -6,56 +6,42 @@ import {
     encodeFrame,
     popPayload,
     SESSION_FATAL_CODES,
-    WireError,
     type AdmittedHeader,
     type ErrorHeader,
     type Frame,
-    type RelayLimits,
-    type RelayRole,
-} from '@/schemas/relay-wire'
+    type PeerHeader,
+    type Role,
+} from '@/relay-protocol'
 
 // Outbound WSS client to the relay (v2 §4.2, §6 phase 5): dial with the relay token, answer the
-// Ed25519 proof-of-possession challenge, adopt the ADMITTED limits, watch heartbeats, and
-// reconnect with exponential backoff. The relay never dials in; every byte the tunnel receives
-// rides a socket this client opened. Transport seam for the long-poll fallback (v2 §15.3): the
-// rest of the tunnel sees only `send()` and the events below.
+// Ed25519 proof-of-possession challenge, track the peer's presence from ADMITTED/PEER frames,
+// watch heartbeats, and reconnect with exponential backoff. The relay never dials in; every byte
+// the tunnel receives rides a socket this client opened.
 
 export type RelayClientState = 'idle' | 'connecting' | 'authenticating' | 'admitted' | 'backoff' | 'stopped' | 'fatal'
-
-export type RelayClientTuning = {
-    heartbeatMs: number
-    heartbeatMisses: number
-    reconnectMinMs: number
-    reconnectMaxMs: number
-}
 
 export type RelayClientOptions = {
     endpoint: string
     relaySessionId: string
     legId: string
-    role: RelayRole
+    role: Role
     /** Returns the current (pre-fetched) relay token; called on every dial. */
     tokenProvider: () => Promise<string> | string
     /** Ed25519 signature over the domain-separated PoP payload (identity.signPop). */
     signChallenge: (payload: Buffer) => Buffer
-    tuning: RelayClientTuning
+    tuning: { heartbeatMs: number; heartbeatMisses: number; reconnectMinMs: number; reconnectMaxMs: number }
     wsFactory?: (url: string) => WebSocket
     random?: () => number
     now?: () => number
 }
 
-export type DisconnectInfo = { code: number; reason: string; wasAdmitted: boolean }
-export type ReconnectInfo = { attempt: number; delayMs: number; cause: string }
-
 export interface RelayClientEvents {
     admitted: [header: AdmittedHeader]
+    /** The peer attached or detached (also fired right after ADMITTED with the peer's state). */
+    peer: [peer: PeerHeader]
     frame: [frame: Frame]
-    rejected: [header: ErrorHeader]
-    displaced: [header: ErrorHeader]
     fatal: [reason: string, header?: ErrorHeader]
-    disconnected: [info: DisconnectInfo]
-    reconnecting: [info: ReconnectInfo]
-    protocolError: [error: Error]
+    disconnected: [info: { code: number; wasAdmitted: boolean }]
 }
 
 export class RelayClient extends EventEmitter<RelayClientEvents> {
@@ -66,9 +52,10 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
     private heartbeatTimer: NodeJS.Timeout | null = null
     private lastActivity = 0
     private currentState: RelayClientState = 'idle'
-    private admittedHeader: AdmittedHeader | null = null
     private readonly now: () => number
     private readonly random: () => number
+    /** What the relay last told us about the other side of the session. */
+    peer: PeerHeader = { attached: false }
 
     constructor(private readonly options: RelayClientOptions) {
         super()
@@ -84,12 +71,8 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
         return this.currentState === 'admitted'
     }
 
-    get limits(): RelayLimits | undefined {
-        return this.admittedHeader?.limits
-    }
-
-    get reconnectAttempts(): number {
-        return this.attempt
+    get peerAttached(): boolean {
+        return this.admitted && this.peer.attached
     }
 
     start(): void {
@@ -99,7 +82,7 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
     }
 
     stop(): void {
-        this.setState('stopped')
+        this.currentState = 'stopped'
         this.clearTimers()
         const ws = this.ws
         this.ws = null
@@ -122,7 +105,7 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
 
     private async dial(cause: string): Promise<void> {
         if (this.currentState === 'stopped' || this.currentState === 'fatal') return
-        this.setState('connecting')
+        this.currentState = 'connecting'
         const id = ++this.dialId
         let token: string
         try {
@@ -137,11 +120,10 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
         const ws = (this.options.wsFactory ?? ((url) => new WebSocket(url)))(this.options.endpoint)
         this.ws = ws
         ws.binaryType = 'nodebuffer'
-
         ws.on('open', () => {
             if (id !== this.dialId) return ws.terminate()
             this.touch()
-            this.setState('authenticating')
+            this.currentState = 'authenticating'
             ws.send(
                 encodeFrame({
                     type: 'HELLO',
@@ -156,7 +138,6 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
             try {
                 frame = decodeFrame(Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer))
             } catch (error) {
-                this.emit('protocolError', error instanceof Error ? error : new WireError('header_json'))
                 log.warn('relay.malformed_frame', {
                     relaySessionId: this.options.relaySessionId,
                     ...errorFields(error),
@@ -168,17 +149,17 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
         ws.on('ping', () => this.touch())
         ws.on('pong', () => this.touch())
         ws.on('error', (error) => {
-            if (id !== this.dialId) return
-            log.warn('relay.socket_error', { relaySessionId: this.options.relaySessionId, ...errorFields(error) })
+            if (id === this.dialId)
+                log.warn('relay.socket_error', { relaySessionId: this.options.relaySessionId, ...errorFields(error) })
         })
-        ws.on('close', (code, reason) => {
+        ws.on('close', (code) => {
             if (id !== this.dialId) return
             this.stopHeartbeat()
             this.ws = null
             const wasAdmitted = this.currentState === 'admitted'
-            this.admittedHeader = wasAdmitted ? this.admittedHeader : null
+            this.peer = { attached: false }
             if (this.currentState === 'stopped' || this.currentState === 'fatal') return
-            this.emit('disconnected', { code, reason: reason.toString('utf8'), wasAdmitted })
+            this.emit('disconnected', { code, wasAdmitted })
             log.info('relay.disconnected', { relaySessionId: this.options.relaySessionId, code, wasAdmitted })
             this.scheduleReconnect(`close:${code}`)
         })
@@ -211,18 +192,28 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
                     h.legId !== this.options.legId ||
                     h.role !== this.options.role
                 ) {
-                    // The relay's view of our session disagrees with the bundle — a provisioning error.
-                    this.fatal('admitted_mismatch')
-                    return
+                    return this.fatal('admitted_mismatch') // the relay's view of our session disagrees with the bundle
                 }
-                this.admittedHeader = h
                 this.attempt = 0
-                this.setState('admitted')
+                this.currentState = 'admitted'
+                this.peer = h.peer
                 this.startHeartbeat(h.heartbeatIntervalMs)
-                log.info('relay.admitted', { relaySessionId: h.relaySessionId, legId: h.legId, role: h.role })
+                log.info('relay.admitted', {
+                    relaySessionId: h.relaySessionId,
+                    legId: h.legId,
+                    role: h.role,
+                    peerAttached: h.peer.attached,
+                })
                 this.emit('admitted', h)
+                this.emit('peer', h.peer)
                 return
             }
+            case 'PEER':
+                if (this.currentState !== 'admitted') return this.violation('PEER before admission')
+                this.peer = frame.header
+                log.info('relay.peer', { relaySessionId: this.options.relaySessionId, attached: frame.header.attached })
+                this.emit('peer', frame.header)
+                return
             case 'ERROR':
                 return this.handleError(frame.header)
             default:
@@ -238,31 +229,19 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
             retryable: header.retryable,
             messageId: header.messageId,
         })
-        if (header.code === 'AUTH_ROLE_OCCUPIED_DISPLACED') {
-            // A valid re-admission (normally our own re-dial) took the slot; the relay closes this socket.
-            this.emit('displaced', header)
-            return
-        }
-        if (SESSION_FATAL_CODES.has(header.code) || header.code === 'AUTH_POP_FAILED') {
-            this.fatal(header.code, header)
-            return
-        }
-        if (this.currentState !== 'admitted') {
-            // Admission refused; the relay closes the socket and the close handler backs off. An
-            // expired/invalid token is retried with whatever the token provider hands us next.
-            this.emit('rejected', header)
-            return
-        }
-        this.emit('frame', { type: 'ERROR', header })
+        if (SESSION_FATAL_CODES.has(header.code) || header.code === 'AUTH_POP_FAILED')
+            return this.fatal(header.code, header)
+        // AUTH_ROLE_OCCUPIED_DISPLACED and admission refusals close the socket; the close handler backs off
+        // and re-dials with whatever token the provider hands us next. Retryable errors reach the delivery layer.
+        if (this.currentState === 'admitted') this.emit('frame', { type: 'ERROR', header })
     }
 
     private violation(detail: string): void {
         log.warn('relay.protocol_violation', { relaySessionId: this.options.relaySessionId, detail })
-        this.emit('protocolError', new Error(detail))
     }
 
     private fatal(reason: string, header?: ErrorHeader): void {
-        this.setState('fatal')
+        this.currentState = 'fatal'
         this.clearTimers()
         log.error('relay.fatal', { relaySessionId: this.options.relaySessionId, reason })
         this.emit('fatal', reason, header)
@@ -274,12 +253,17 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
 
     private scheduleReconnect(cause: string): void {
         if (this.currentState === 'stopped' || this.currentState === 'fatal') return
-        this.setState('backoff')
+        this.currentState = 'backoff'
         const { reconnectMinMs, reconnectMaxMs } = this.options.tuning
         const base = Math.min(reconnectMaxMs, reconnectMinMs * 2 ** this.attempt)
         const delayMs = Math.round(base * (0.5 + this.random() * 0.5))
         this.attempt++
-        this.emit('reconnecting', { attempt: this.attempt, delayMs, cause })
+        log.info('relay.reconnecting', {
+            relaySessionId: this.options.relaySessionId,
+            attempt: this.attempt,
+            delayMs,
+            cause,
+        })
         this.reconnectTimer = setTimeout(() => {
             this.reconnectTimer = null
             void this.dial(cause)
@@ -291,8 +275,7 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
         this.stopHeartbeat()
         // The relay advertises its ping cadence; 0 means it sends none, so there is nothing to watch.
         if (intervalMs === 0) return
-        const interval = intervalMs
-        const limit = interval * this.options.tuning.heartbeatMisses
+        const limit = intervalMs * this.options.tuning.heartbeatMisses
         this.heartbeatTimer = setInterval(() => {
             if (this.now() - this.lastActivity > limit) {
                 log.warn('relay.heartbeat_missed', {
@@ -301,7 +284,7 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
                 })
                 this.ws?.terminate()
             }
-        }, interval)
+        }, intervalMs)
         this.heartbeatTimer.unref()
     }
 
@@ -318,9 +301,5 @@ export class RelayClient extends EventEmitter<RelayClientEvents> {
 
     private touch(): void {
         this.lastActivity = this.now()
-    }
-
-    private setState(state: RelayClientState): void {
-        this.currentState = state
     }
 }

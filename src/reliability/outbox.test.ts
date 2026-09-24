@@ -1,17 +1,15 @@
 import { describe, it, expect } from 'vitest'
 import { Outbox } from './outbox'
 
-const entry = (messageId: string, sizeBytes = 100) => ({
+const entry = (messageId: string, bytes = 100) => ({
     messageId,
     kind: 'query' as const,
     correlationId: 'c',
-    plaintext: Buffer.from('x'),
-    sizeBytes,
-    wireSizeBytes: sizeBytes,
+    plaintext: Buffer.alloc(bytes),
 })
 
 describe('Outbox', () => {
-    it('bounds by message count and bytes and keeps insertion order', () => {
+    it('bounds by message count and plaintext bytes and keeps insertion order', () => {
         const outbox = new Outbox({ maxMsgs: 2, maxBytes: 250 })
         expect(outbox.add(entry('a'))).toBe(true)
         expect(outbox.add(entry('a'))).toBe(true) // idempotent
@@ -27,15 +25,19 @@ describe('Outbox', () => {
         expect(outbox.remove('zzz')).toBeUndefined()
     })
 
-    it('tracks sends per epoch and invalidates them all on a new epoch or reconnect', () => {
-        const outbox = new Outbox({ maxMsgs: 10, maxBytes: 10_000 })
+    it('tracks sends per epoch, invalidates them on a new epoch or re-attach, and finds stale ones', () => {
+        let now = 1000
+        const outbox = new Outbox({ maxMsgs: 10, maxBytes: 10_000 }, () => now)
         outbox.add(entry('a'))
         outbox.add(entry('b'))
         expect(outbox.pendingFor('e1').map((e) => e.messageId)).toEqual(['a', 'b'])
         outbox.markSent('a', 'e1')
         expect(outbox.pendingFor('e1').map((e) => e.messageId)).toEqual(['b'])
-        expect(outbox.get('a')?.sends).toBe(1)
+        expect(outbox.get('a')).toMatchObject({ sends: 1, lastSentAt: 1000 })
+        now = 6000
         outbox.markSent('b', 'e1')
+        expect(outbox.staleSince('e1', 5000).map((e) => e.messageId)).toEqual(['a'])
+        expect(outbox.staleSince('e2', 9999)).toEqual([])
         expect(outbox.pendingFor('e2')).toHaveLength(2)
         outbox.invalidateSent()
         expect(outbox.pendingFor('e1')).toHaveLength(2)
@@ -44,7 +46,5 @@ describe('Outbox', () => {
         expect(outbox.pendingFor('e1')).toHaveLength(2)
         outbox.markSent('missing', 'e1')
         outbox.resetSent('missing')
-        outbox.setLimits({ maxMsgs: 1, maxBytes: 1 })
-        expect(outbox.limitsInEffect).toEqual({ maxMsgs: 1, maxBytes: 1 })
     })
 })

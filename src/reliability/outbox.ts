@@ -1,38 +1,19 @@
 import type { MessageKind } from '@/lib/exchange'
 
-// Bounded in-memory plaintext outbox of sent-but-unacknowledged messages (v2 §4.1, §7.3). The
-// bound mirrors the relay's in-flight window; retransmission across an epoch change re-encrypts
-// from here, never from relay ciphertext. Eviction is the end-to-end stage-two ACK.
-
-export type OutboundKind = MessageKind | 'control'
+// Bounded in-memory plaintext outbox of sent-but-unacknowledged messages (v2 §4.1, §7.3).
+// Retransmission — across an epoch change, a reconnect, a peer re-attach, or a retransmit timer
+// tick — re-encrypts from here, never from relay ciphertext. Eviction is the end-to-end ACK.
 
 export type OutboxEntry = {
     messageId: string
-    kind: OutboundKind
-    correlationId?: string
+    kind: MessageKind
+    correlationId: string
     /** Canonical channel-message bytes; what gets padded, chunked and sealed on every (re)send. */
     plaintext: Buffer
-    /**
-     * Bytes this entry occupies in the local window bound. For inline messages this equals the wire
-     * size; for blob messages it also counts the sealed blob kept for re-upload.
-     */
-    sizeBytes: number
-    /** Declared wire size of the frames sent through the mailbox (the pointer, for a blob message). */
-    wireSizeBytes: number
-    /** Present for messages travelling by the blob path (v2 §7.2). */
-    blob?: {
-        blobId: string
-        /** Sealed blob kept until ACK so a purged blob can be re-uploaded. */
-        ciphertext: Buffer
-        uploaded: boolean
-        uploading: boolean
-        attempts: number
-    }
-    /** Plaintext messageId of the query a response answers (relay retention rule). */
-    respondsTo?: string
     /** Epoch tag the entry was last fully sent under; undefined means it needs (re)sending. */
     sentEpoch?: string
     sends: number
+    lastSentAt?: number
     createdAt: number
 }
 
@@ -41,25 +22,17 @@ export class Outbox {
     private bytes = 0
 
     constructor(
-        private limits: { maxMsgs: number; maxBytes: number },
+        private readonly limits: { maxMsgs: number; maxBytes: number },
         private readonly now: () => number = Date.now,
     ) {}
 
-    setLimits(limits: { maxMsgs: number; maxBytes: number }): void {
-        this.limits = limits
-    }
-
-    get limitsInEffect(): { maxMsgs: number; maxBytes: number } {
-        return this.limits
-    }
-
     /** False when the window is full — the caller surfaces back-pressure instead of queueing. */
-    add(entry: Omit<OutboxEntry, 'sends' | 'createdAt' | 'sentEpoch'>): boolean {
+    add(entry: Pick<OutboxEntry, 'messageId' | 'kind' | 'correlationId' | 'plaintext'>): boolean {
         if (this.entries.has(entry.messageId)) return true
         if (this.entries.size >= this.limits.maxMsgs) return false
-        if (this.bytes + entry.sizeBytes > this.limits.maxBytes) return false
+        if (this.bytes + entry.plaintext.byteLength > this.limits.maxBytes) return false
         this.entries.set(entry.messageId, { ...entry, sends: 0, createdAt: this.now() })
-        this.bytes += entry.sizeBytes
+        this.bytes += entry.plaintext.byteLength
         return true
     }
 
@@ -67,7 +40,7 @@ export class Outbox {
         const entry = this.entries.get(messageId)
         if (!entry) return undefined
         this.entries.delete(messageId)
-        this.bytes -= entry.sizeBytes
+        this.bytes -= entry.plaintext.byteLength
         return entry
     }
 
@@ -79,7 +52,7 @@ export class Outbox {
         return this.entries.get(messageId)
     }
 
-    /** Insertion order == send order == relay FIFO order. */
+    /** Insertion order == send order. */
     inOrder(): OutboxEntry[] {
         return [...this.entries.values()]
     }
@@ -94,9 +67,10 @@ export class Outbox {
         if (!entry) return
         entry.sentEpoch = epochTag
         entry.sends++
+        entry.lastSentAt = this.now()
     }
 
-    /** Forget every send: after a new epoch (relay purged the old one) or a reconnect. */
+    /** Forget every send: after a new epoch, a reconnect, or the peer re-attaching. */
     invalidateSent(): void {
         for (const entry of this.entries.values()) entry.sentEpoch = undefined
     }
@@ -104,6 +78,11 @@ export class Outbox {
     resetSent(messageId: string): void {
         const entry = this.entries.get(messageId)
         if (entry) entry.sentEpoch = undefined
+    }
+
+    /** Entries sent under `epochTag` whose last send is older than `before`. */
+    staleSince(epochTag: string, before: number): OutboxEntry[] {
+        return this.inOrder().filter((e) => e.sentEpoch === epochTag && (e.lastSentAt ?? 0) < before)
     }
 
     get depth(): number {

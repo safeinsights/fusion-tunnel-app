@@ -1,10 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { pad, unpad, bucketFor, capacityOf, PaddingError } from './padding'
-import { TUNING_DEFAULTS } from '@/config'
-import { TRANSPORT_FRAME_OVERHEAD } from '@/schemas/channel'
+import { PAD_BUCKETS, TRANSPORT_FRAME_OVERHEAD } from '@/schemas/channel'
 
-const buckets = TUNING_DEFAULTS.padBuckets
+const buckets = PAD_BUCKETS
 
 describe('padding', () => {
     it('pads to the smallest bucket that fits and unpads exactly', () => {

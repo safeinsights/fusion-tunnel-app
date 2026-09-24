@@ -1,8 +1,8 @@
 import { z } from 'zod'
-import { BudgetSchema, JsonValueSchema } from '@/schemas/local-api'
+import { MAX_CHUNK_BYTES } from '@/relay-protocol'
 
-// Byte layouts of the end-to-end channel — WIRE CONTRACTS, frozen at v1 (plan Phase 3). Both
-// tunnels must produce identical bytes; any change is a protocol version bump.
+// Byte layouts of the end-to-end channel — WIRE CONTRACTS between the two tunnels, frozen at v1.
+// Both tunnels must produce identical bytes; any change is a protocol version bump.
 
 export const NOISE_PROTOCOL = 'Noise_IK_25519_ChaChaPoly_BLAKE2b'
 
@@ -49,8 +49,8 @@ export const CHUNK_HEADER_BYTES = CHUNK_AAD_DOMAIN.length + 16 + 4 + 4 + 16
 /**
  * Transport frame = u64BE counter ‖ ChaCha20-Poly1305 ciphertext (plaintext ‖ 16-byte tag).
  * The counter is the AEAD nonce (Noise encoding: 32 zero bits ‖ u64LE n) and is carried
- * explicitly because the relay redelivers byte-identical frames within an epoch; the receiver
- * keeps a per-direction replay window instead of an implicit counter (ADR 0001).
+ * explicitly because frames can be lost or reordered across socket drops and retransmissions;
+ * the receiver keeps a per-direction replay window instead of an implicit counter (ADR 0001).
  */
 export const TRANSPORT_COUNTER_BYTES = 8
 export const AEAD_TAG_BYTES = 16
@@ -60,16 +60,53 @@ export const REPLAY_WINDOW = 1024
 
 /** Epoch tag = first 8 bytes of the Noise handshake hash, hex — identifies one set of session keys. */
 export const EPOCH_TAG_BYTES = 8
+export const EpochTagSchema = z.string().regex(/^[0-9a-f]{16}$/)
+
+/**
+ * Padding (v2 §7.2, §9): every transport frame on the wire is one of these sizes. Buckets are
+ * security parameters, not tuning: they bound what the relay can learn from frame sizes, so they
+ * are frozen here rather than read from the environment. Each chunk plaintext is
+ * `u32BE dataLen ‖ data ‖ zero fill` up to `bucket − TRANSPORT_FRAME_OVERHEAD`.
+ */
+export const PAD_BUCKETS: readonly number[] = Object.freeze([1024, 2048, 4096, 8192, 16384, MAX_CHUNK_BYTES])
+export const PAD_LENGTH_BYTES = 4
 
 // ---- channel message (the plaintext inside the AEAD) ------------------------------------------
 
 /**
  * What one logical message decrypts to, as canonical UTF-8 JSON. `correlationId` lives here,
- * inside the ciphertext, never in relay-visible metadata. Control messages ride the same path so
- * they are authenticated end to end: LIMIT_EXCEEDED (source → destination, caps breach) and CLOSE
- * (destination → source, v2 §7.6). `budget` is the source's content-free consumption hint.
+ * inside the ciphertext, never in relay-visible metadata. The only control message is CLOSE, which
+ * carries the terminal code (v2 §7.6): the peer learns whether the study completed, a cap was
+ * breached, or the session errored from an authenticated message, never from the relay.
  */
 export const CHANNEL_MESSAGE_VERSION = 1
+
+export const JsonValueSchema = z.json()
+export type JsonValue = z.infer<typeof JsonValueSchema>
+
+/** Remaining-budget hint piggybacked on responses (security review §7.3); the source's counters. */
+export const BudgetSchema = z.object({
+    roundsUsed: z.int().nonnegative(),
+    roundsMax: z.int().positive().optional(),
+    responseBytesUsed: z.int().nonnegative(),
+    responseBytesMax: z.int().positive().optional(),
+    queryBytesUsed: z.int().nonnegative(),
+    queryBytesMax: z.int().positive().optional(),
+    roundsPerHourUsed: z.int().nonnegative().optional(),
+    roundsPerHourMax: z.int().positive().optional(),
+})
+export type Budget = z.infer<typeof BudgetSchema>
+
+/** Why a leg ended; carried in the authenticated CLOSE and echoed by the local API's terminal body. */
+export const TerminalCodeSchema = z.enum(['STUDY_COMPLETE', 'SESSION_ERRORED', 'LIMIT_EXCEEDED'])
+export type TerminalCode = z.infer<typeof TerminalCodeSchema>
+
+export const LimitSchema = z.object({
+    cap: z.string().min(1).max(64),
+    limit: z.int().nonnegative(),
+    observed: z.int().nonnegative(),
+})
+export type Limit = z.infer<typeof LimitSchema>
 
 export const ChannelMessageSchema = z.discriminatedUnion('kind', [
     z.object({
@@ -88,45 +125,12 @@ export const ChannelMessageSchema = z.discriminatedUnion('kind', [
     z.object({
         v: z.literal(CHANNEL_MESSAGE_VERSION),
         kind: z.literal('control'),
-        control: z.enum(['CLOSE', 'LIMIT_EXCEEDED']),
+        control: z.literal('CLOSE'),
+        code: TerminalCodeSchema,
         reason: z.string().max(256).optional(),
         budget: BudgetSchema.optional(),
+        limit: LimitSchema.optional(),
     }),
 ])
 export type ChannelMessage = z.infer<typeof ChannelMessageSchema>
-
-/** Padding: each chunk plaintext is `u32BE dataLen ‖ data ‖ zero fill` up to `bucket − TRANSPORT_FRAME_OVERHEAD`. */
-export const PAD_LENGTH_BYTES = 4
-/** Smallest sensible padding bucket (frame size): room for the counter, tag, length prefix and some data. */
-export const MIN_PAD_BUCKET = 64
-
-// ---- blob path (v2 §7.2) ----------------------------------------------------------------------
-
-/**
- * Above the inline cap a message travels as a ciphertext blob in the relay blob store and a small
- * pointer through the channel. The blob plaintext is the full query/response channel message; the
- * blob is sealed under a fresh ChaCha20-Poly1305 content key as `nonce(12) ‖ ciphertext ‖ tag(16)`
- * with the blobId as associated data. The pointer — itself inside the Noise channel — carries the
- * content key, so "wrapping" is the channel encryption. Blobs survive epoch changes; the pointer is
- * what gets re-encrypted and re-sent.
- */
-export const BLOB_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/
-export const BLOB_NONCE_BYTES = 12
-export const BLOB_KEY_BYTES = 32
-
-export const BlobPointerSchema = z.object({
-    v: z.literal(CHANNEL_MESSAGE_VERSION),
-    kind: z.literal('blob-pointer'),
-    blobId: z.string().regex(BLOB_ID_PATTERN),
-    /** base64url, 32 bytes. */
-    contentKey: z.base64url(),
-    /** Ciphertext bytes stored at the relay (nonce ‖ body ‖ tag). */
-    size: z.int().positive(),
-    /** base64url SHA-256 of the blob plaintext (the inner channel message). */
-    sha256: z.base64url(),
-})
-export type BlobPointer = z.infer<typeof BlobPointerSchema>
-
-/** Everything that may arrive through the channel: a message, a control, or a pointer to a blob. */
-export const ChannelEnvelopeSchema = z.union([ChannelMessageSchema, BlobPointerSchema])
-export type ChannelEnvelope = z.infer<typeof ChannelEnvelopeSchema>
+export type CloseMessage = Extract<ChannelMessage, { kind: 'control' }>

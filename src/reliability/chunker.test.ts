@@ -1,11 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { randomBytes } from 'node:crypto'
 import { splitMessage, frameSizesFor, declaredSizeFor, maxChunkData, chunkCountFor } from './chunker'
-import { TUNING_DEFAULTS } from '@/config'
-import { TRANSPORT_FRAME_OVERHEAD } from '@/schemas/channel'
+import { PAD_BUCKETS, TRANSPORT_FRAME_OVERHEAD } from '@/schemas/channel'
 import { capacityOf, pad } from './padding'
 
-const buckets = TUNING_DEFAULTS.padBuckets
+const buckets = PAD_BUCKETS
 
 describe('chunker', () => {
     it('sizes chunks so every sealed frame fits the largest bucket', () => {

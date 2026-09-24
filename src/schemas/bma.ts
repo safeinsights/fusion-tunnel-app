@@ -1,8 +1,8 @@
 import { sign as rsaSign, verify as rsaVerify, createPublicKey, type KeyObject } from 'node:crypto'
 import { z } from 'zod'
 import { STATES } from '@/lib/lifecycle'
-import { EpochTagSchema } from '@/schemas/relay-wire'
-import { BudgetSchema } from '@/schemas/local-api'
+import { BudgetSchema, TerminalCodeSchema } from '@/local-api'
+import { EpochTagSchema } from '@/schemas/channel'
 import { CapsConsumedSchema, RoleSchema } from '@/schemas/provisioning'
 
 // Management-App (BMA) fusion contract as the tunnel consumes it (owned here — plan §0.3; the
@@ -139,10 +139,7 @@ export const RelaySessionResponseSchema = z.object({
 export type RelaySessionResponse = z.infer<typeof RelaySessionResponseSchema>
 
 /** POST /tunnel/credential — delegated credential; returns a fresh one. */
-export const CredentialResponseSchema = z.object({
-    credential: z.string().min(1),
-    expiresAt: z.iso.datetime(),
-})
+export const CredentialResponseSchema = z.object({ credential: z.string().min(1), expiresAt: z.iso.datetime() })
 export type CredentialResponse = z.infer<typeof CredentialResponseSchema>
 
 // ---- status reports --------------------------------------------------------------------------
@@ -168,38 +165,13 @@ export const StatusReportSchema = z.strictObject({
     messagesSent: z.int().nonnegative(),
     messagesAcked: z.int().nonnegative(),
     messagesReceived: z.int().nonnegative(),
-    lastSeqReceived: z.int().nonnegative().optional(),
     roundsCompleted: z.int().nonnegative(),
     outboxDepth: z.int().nonnegative(),
     pendingAcks: z.int().nonnegative(),
-    caps: z
-        .strictObject({
-            consumed: CapsConsumedSchema,
-            budget: BudgetSchema,
-        })
-        .optional(),
+    caps: z.strictObject({ consumed: CapsConsumedSchema, budget: BudgetSchema }).optional(),
     peerKeyRejected: z.boolean(),
-    terminal: z
-        .strictObject({
-            code: z.enum(['STUDY_COMPLETE', 'SESSION_ERRORED', 'LIMIT_EXCEEDED']),
-            reason: z.string().max(256),
-        })
-        .optional(),
-    reason: z.enum(['interval', 'near_limit', 'transition', 'terminal', 'round', 'shutdown']),
+    terminal: z.strictObject({ code: TerminalCodeSchema, reason: z.string().max(256) }).optional(),
+    reason: z.enum(['interval', 'near_limit', 'transition', 'terminal', 'shutdown']),
     reportedAt: z.iso.datetime(),
 })
 export type StatusReport = z.infer<typeof StatusReportSchema>
-
-// ---- run groups (BMA state machine, mirrored for the harness) -------------------------------
-
-export const RunLegSchema = z.object({
-    legId: Id,
-    sourceOrgSlug: OrgSlug,
-    destinationOrgSlug: OrgSlug,
-    sourceJobId: Id,
-    destinationJobId: Id,
-})
-export type RunLeg = z.infer<typeof RunLegSchema>
-
-export const RunStatusSchema = z.enum(['pending', 'visible', 'paired-running', 'complete', 'failed'])
-export type RunStatus = z.infer<typeof RunStatusSchema>

@@ -1,4 +1,4 @@
-# Local end-to-end stacks for the tunnel (plan Phase 9). Two profiles:
+# Local end-to-end stacks for the tunnel. Two profiles:
 #
 #   docker compose --profile two-party run --rm rc-dst     one leg: source dp-a → destination si-hub
 #   docker compose --profile hub run --rm rc-dst           hub: two legs (dp-a, dp-b) into one destination enclave
@@ -44,6 +44,7 @@ services:
         profiles: [two-party, hub]
         command: ['pnpm', 'exec', 'tsx', 'testing/bin/fake-bma.ts']
         environment:
+            HOST: 0.0.0.0
             PORT: 4500
             RELAY_WS_URL: ws://fake-relay:4400/ws
         networks: [core]
@@ -58,6 +59,7 @@ services:
         profiles: [two-party, hub]
         command: ['pnpm', 'exec', 'tsx', 'testing/bin/fake-relay.ts']
         environment:
+            HOST: 0.0.0.0
             PORT: 4400
             BMA_URL: http://fake-bma:4500
         depends_on:

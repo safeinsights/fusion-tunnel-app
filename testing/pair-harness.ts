@@ -1,9 +1,9 @@
 import { randomBytes } from 'node:crypto'
 import { v4 as uuidv4 } from 'uuid'
-import type { VerifiedPeer } from '@/lib/channel'
+import type { VerifiedPeer } from '@/lib/bma/verify-peer-key'
 import type { ConfigurationBundle, Role } from '@/schemas/provisioning'
 import { FakeRelay, type FakeRelayOptions } from '@/testing/fake-relay'
-import { api, makeBundle, startTunnel, type RunningTunnel } from '@/testing/fixtures'
+import { api, makeBundle, startTunnel, type ApiResult, type RunningTunnel } from '@/testing/fixtures'
 import { mintRelayToken, testBmaKey } from '@/testing/relay-tokens'
 
 // Two real tunnels (in-process, real HTTP and real WebSockets) through the fake relay, with the
@@ -40,6 +40,7 @@ export const peerOf = (side: Side): VerifiedPeer => ({
     publicKey: side.tunnel.identity.publicKey,
     connectionId: side.tunnel.identity.connectionId,
     generation: side.keyGeneration,
+    fingerprint: side.tunnel.identity.fingerprint,
 })
 
 export const until = async <T>(
@@ -145,6 +146,17 @@ export const startPair = async (options: PairOptions = {}): Promise<Pair> => {
     return pair
 }
 
+/** Poll a local-API route until it answers 200; returns the body. */
+export const poll200 = (call: () => Promise<ApiResult>, label: string, timeoutMs = 5000) =>
+    until(
+        async () => {
+            const res = await call()
+            return res.status === 200 ? res.body : undefined
+        },
+        timeoutMs,
+        label,
+    )
+
 /** Drive one full round through the local APIs; returns what each RC saw. */
 export const runRound = async (pair: Pair, query: unknown, answer: (query: unknown) => unknown) => {
     const dst = pair.dstApi()
@@ -153,26 +165,17 @@ export const runRound = async (pair: Pair, query: unknown, answer: (query: unkno
     if (submitted.status !== 202)
         throw new Error(`request failed: ${submitted.status} ${JSON.stringify(submitted.body)}`)
     const { correlationId } = submitted.body as { correlationId: string }
-    const delivered = await until(
-        async () => {
-            const res = await src.get('/v1/messages/next')
-            return res.status === 200 ? res : undefined
-        },
-        5000,
-        'query delivery',
-    )
-    const q = delivered.body as { messageId: string; correlationId: string; payload: unknown }
-    await src.post(`/v1/messages/${q.messageId}/ack`)
+    const q = (await poll200(() => src.get('/v1/messages/next'), 'query delivery')) as {
+        messageId: string
+        correlationId: string
+        payload: unknown
+    }
     const responded = await src.post('/v1/messages', { inReplyTo: q.correlationId, payload: answer(q.payload) })
-    const response = await until(
-        async () => {
-            const res = await dst.get(`/v1/responses/${correlationId}`)
-            return res.status === 200 ? res : undefined
-        },
-        5000,
-        'response delivery',
-    )
-    const r = response.body as { messageId: string; correlationId: string; payload: unknown; budget?: unknown }
-    await dst.post(`/v1/messages/${r.messageId}/ack`)
+    const r = (await poll200(() => dst.get(`/v1/responses/${correlationId}`), 'response delivery')) as {
+        messageId: string
+        correlationId: string
+        payload: unknown
+        budget?: unknown
+    }
     return { correlationId, query: q, responded, response: r }
 }

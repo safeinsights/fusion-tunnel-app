@@ -1,55 +1,30 @@
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
-import { randomBytes } from 'node:crypto'
-import { BLOB_ID_PATTERN } from '@/schemas/channel'
 import jwt from 'jsonwebtoken'
 import WebSocket, { WebSocketServer } from 'ws'
 import {
+    closeCodeFor,
     decodeFrame,
     encodeFrame,
-    popPayload,
-    verifyPop,
-    RelayTokenClaimsSchema,
+    newNonce,
+    popPublicKeyFromRaw,
     RELAY_TOKEN_AUDIENCE,
-    CLOSE_CODES,
-    type DataHeader,
+    RelayTokenClaims,
+    verifyPop,
     type ErrorHeader,
+    type ErrorCode,
     type Frame,
-    type RelayErrorCode,
-    type RelayLimits,
-    type RelayRole,
-    type RelayTokenClaims,
-} from '@/schemas/relay-wire'
+    type PeerHeader,
+    type Role,
+} from '@/relay-protocol'
 
-// In-repo test double for the Fusion Relay (plan Phase 4), built on schemas/relay-wire.ts so it
-// doubles as the relay team's executable contract: token + PoP admission, one live connection per
-// role with displacement, pairing by relaySessionId, per-direction FIFO mailboxes with the
-// buffered → delivered → consumed → deleted states and the query-retention rule, NACK-discard,
-// old-epoch purge on new-fingerprint admission, in-flight window with BACKPRESSURE, PEER_REJOINED,
-// HANDSHAKE forwarding (live peer only, never mailboxed), CLOSE orchestration, delivery counting
-// with dead-letter, and heartbeats. Everything is in memory. It reads routing metadata only —
-// payloads are opaque Buffers it never inspects.
-
-export type Direction = 'dstToSrc' | 'srcToDst'
-export type MessageState = 'buffered' | 'delivered' | 'consumed'
-
-export type MailboxItem = {
-    seq: number
-    messageId: string
-    chunkIndex: number
-    chunkCount: number
-    epochTag: string
-    respondsTo?: string
-    sizeBytes: number
-    payload: Buffer
-    /** Meaningful on the lead chunk (chunkIndex 0). */
-    msgState: MessageState
-    deliveryCount: number
-    createdAt: number
-}
+// In-repo test double for the Fusion Relay, built on the verbatim protocol copy: token + PoP
+// admission, one live socket per role with displacement, pairing by relaySessionId, peer-presence
+// frames carrying the peer's fingerprint, forwarding of DATA/ACK/NACK/HANDSHAKE to a live peer
+// (dropped otherwise), CLOSE orchestration with a close timeout, and heartbeats. It stores nothing
+// and reads routing metadata only — payloads are opaque Buffers it never inspects.
 
 type Conn = {
-    id: number
     ws: WebSocket
     phase: 'hello' | 'challenge' | 'admitted'
     claims?: RelayTokenClaims
@@ -64,87 +39,57 @@ export type Session = {
     relaySessionId: string
     studyId: string
     legId: string
-    epoch: number
     status: SessionStatus
-    sockets: Partial<Record<RelayRole, Conn>>
-    fingerprints: Partial<Record<RelayRole, string>>
-    mailbox: Record<Direction, MailboxItem[]>
-    nextSeq: Record<Direction, number>
-    closeAcks: Partial<Record<RelayRole, boolean>>
+    sockets: Partial<Record<Role, Conn>>
+    fingerprints: Partial<Record<Role, string>>
+    closeAcks: Partial<Record<Role, boolean>>
     closeTimer?: NodeJS.Timeout
     /** The authenticated CLOSE payload, held for a peer that attaches during `closing`. */
-    pendingClose?: { from: RelayRole; payload: Buffer }
-    createdAt: number
+    pendingClose?: { from: Role; payload: Buffer }
+    forwarded: number
 }
 
 export type FakeRelayOptions = {
     bmaPublicKeyPem: string
     heartbeatIntervalMs?: number
-    limits?: Partial<RelayLimits>
-    maxDeliveries?: number
     challengeTimeoutMs?: number
     closeTimeoutMs?: number
     tokenMaxAgeS?: number
     tokenGraceS?: number
+    /** Bind address; 127.0.0.1 by default, 0.0.0.0 for compose. */
+    host?: string
     path?: string
-    maxBlobBytes?: number
-    sessionBlobQuotaBytes?: number
 }
-
-export const DEFAULT_LIMITS: RelayLimits = {
-    windowMsgs: 64,
-    windowBytes: 32 * 1024 * 1024,
-    maxChunkBytes: 32 * 1024,
-    inlineCapBytes: 256 * 1024,
-}
-
-/** Close codes follow the canonical CLOSE_CODES table; unmapped rejections use PROTOCOL_VIOLATION's. */
-const closeCodeFor = (code: RelayErrorCode): number =>
-    (CLOSE_CODES as Record<string, number>)[code] ?? CLOSE_CODES.PROTOCOL_VIOLATION
 
 export interface FakeRelayEvents {
-    admitted: [relaySessionId: string, role: RelayRole, fingerprint: string]
-    rejected: [code: RelayErrorCode]
-    displaced: [relaySessionId: string, role: RelayRole]
-    peerRejoined: [relaySessionId: string, peerRole: RelayRole]
-    epochPurge: [relaySessionId: string, epoch: number, purged: number]
-    data: [relaySessionId: string, direction: Direction, messageId: string, chunkIndex: number]
-    delivered: [relaySessionId: string, direction: Direction, messageId: string, deliveryCount: number]
-    ack: [relaySessionId: string, messageId: string, effect: 'consumed' | 'deleted' | 'noop']
-    nack: [relaySessionId: string, messageId: string]
-    backpressure: [relaySessionId: string, direction: Direction, messageId: string]
-    deadLetter: [relaySessionId: string, messageId: string]
+    admitted: [relaySessionId: string, role: Role, fingerprint: string]
+    rejected: [code: ErrorCode]
+    displaced: [relaySessionId: string, role: Role]
+    peer: [relaySessionId: string, toRole: Role, peer: PeerHeader]
+    forwarded: [relaySessionId: string, from: Role, frame: Frame]
+    dropped: [relaySessionId: string, from: Role, frame: Frame]
     close: [relaySessionId: string, phase: 'requested' | 'acked' | 'purged' | 'timeout' | 'forced']
-    handshakeDropped: [relaySessionId: string, toRole: RelayRole]
-    blobPut: [relaySessionId: string, blobId: string, bytes: number]
-    blobGet: [relaySessionId: string, blobId: string, found: boolean]
-    blobRejected: [status: number, code: string]
-    blobsPurged: [relaySessionId: string, count: number]
 }
 
-const directionFor = (senderRole: RelayRole): Direction => (senderRole === 'destination' ? 'dstToSrc' : 'srcToDst')
-const receivesFrom = (receiverRole: RelayRole): Direction => (receiverRole === 'source' ? 'dstToSrc' : 'srcToDst')
-const peerOf = (role: RelayRole): RelayRole => (role === 'source' ? 'destination' : 'source')
+const peerOf = (role: Role): Role => (role === 'source' ? 'destination' : 'source')
 
 export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     readonly sessions = new Map<string, Session>()
-    readonly limits: RelayLimits
     private readonly http: http.Server
     private readonly wss: WebSocketServer
-    private conns = new Set<Conn>()
-    private connSeq = 0
+    private readonly conns = new Set<Conn>()
     private heartbeat: NodeJS.Timeout | null = null
     private pingEnabled = true
     private port = 0
-    private frameDrops = new Map<string, number>() // `${role}:${type}` → count
-    /** Blob store: relaySessionId → blobId → ciphertext bytes (opaque). */
-    readonly blobStore = new Map<string, Map<string, Buffer>>()
-    private blobFailures: Record<'put' | 'get', number> = { put: 0, get: 0 }
+    private readonly frameDrops = new Map<string, number>() // `${role}:${type}` → count
 
     constructor(readonly options: FakeRelayOptions) {
         super()
-        this.limits = { ...DEFAULT_LIMITS, ...options.limits }
-        this.http = http.createServer((req, res) => this.handleHttp(req, res))
+        this.http = http.createServer((req, res) => {
+            const health = new URL(req.url ?? '/', 'http://relay').pathname === '/api/health'
+            res.writeHead(health ? 200 : 404, { 'content-type': 'application/json' })
+            res.end(JSON.stringify(health ? { success: true } : { error: 'not found' }))
+        })
         this.wss = new WebSocketServer({ server: this.http, path: options.path ?? '/ws' })
         this.wss.on('connection', (ws) => this.onConnection(ws))
     }
@@ -152,7 +97,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     async start(port = 0): Promise<{ port: number; wsUrl: string; httpUrl: string }> {
         await new Promise<void>((resolve, reject) => {
             this.http.once('error', reject)
-            this.http.listen(port, '127.0.0.1', () => resolve())
+            this.http.listen(port, this.options.host ?? '127.0.0.1', () => resolve())
         })
         const address = this.http.address()
         this.port = typeof address === 'object' && address ? address.port : port
@@ -186,7 +131,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     // ---- test hooks ---------------------------------------------------------------------------
 
     /** Drop a live socket without a close frame (simulates a network cut). */
-    dropSocket(relaySessionId: string, role: RelayRole): boolean {
+    dropSocket(relaySessionId: string, role: Role): boolean {
         const conn = this.sessions.get(relaySessionId)?.sockets[role]
         if (!conn) return false
         conn.ws.terminate()
@@ -198,31 +143,13 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     }
 
     /** Swallow the next `count` frames of `type` sent by `role` (a lost ACK, a lost CLOSE_ACK…). */
-    dropNext(role: RelayRole, type: Frame['type'], count = 1): void {
+    dropNext(role: Role, type: Frame['type'], count = 1): void {
         const key = `${role}:${type}`
         this.frameDrops.set(key, (this.frameDrops.get(key) ?? 0) + count)
     }
 
-    dropNextAcks(role: RelayRole, count = 1): void {
-        this.dropNext(role, 'ACK', count)
-    }
-
-    /** Fail the next `count` blob requests of a kind with 503. */
-    failNextBlob(kind: 'put' | 'get', count = 1): void {
-        this.blobFailures[kind] += count
-    }
-
-    blobs(relaySessionId: string): string[] {
-        return [...(this.blobStore.get(relaySessionId)?.keys() ?? [])]
-    }
-
-    /** Drop one blob behind the tunnel's back (a lost or prematurely expired object). */
-    deleteBlob(relaySessionId: string, blobId: string): boolean {
-        return this.blobStore.get(relaySessionId)?.delete(blobId) ?? false
-    }
-
     /** Push an arbitrary frame to a live socket as if the relay had originated it. */
-    injectFrame(relaySessionId: string, role: RelayRole, frame: Frame): boolean {
+    injectFrame(relaySessionId: string, role: Role, frame: Frame): boolean {
         const conn = this.sessions.get(relaySessionId)?.sockets[role]
         if (!conn || conn.ws.readyState !== WebSocket.OPEN) return false
         this.sendFrame(conn.ws, frame)
@@ -233,10 +160,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     forceClose(relaySessionId: string): boolean {
         const session = this.sessions.get(relaySessionId)
         if (!session) return false
-        if (session.closeTimer) clearTimeout(session.closeTimer)
-        session.closeTimer = undefined
-        session.status = 'closed'
-        this.endSession(session, { code: 'SESSION_CLOSED', retryable: false })
+        this.endSession(session, 'closed', 'SESSION_CLOSED')
         this.emit('close', relaySessionId, 'forced')
         return true
     }
@@ -245,114 +169,15 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         return this.sessions.get(relaySessionId)
     }
 
-    isLive(relaySessionId: string, role: RelayRole): boolean {
+    isLive(relaySessionId: string, role: Role): boolean {
         const conn = this.sessions.get(relaySessionId)?.sockets[role]
         return !!conn && conn.ws.readyState === WebSocket.OPEN
-    }
-
-    /** Messages (lead chunks) in a direction, in seq order — for assertions. */
-    messages(relaySessionId: string, direction: Direction): MailboxItem[] {
-        return (this.sessions.get(relaySessionId)?.mailbox[direction] ?? []).filter((i) => i.chunkIndex === 0)
-    }
-
-    // ---- HTTP (blob store lands in Phase 7) -------------------------------------------------------
-
-    private handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
-        const url = new URL(req.url ?? '/', 'http://relay')
-        if (url.pathname === '/api/health') return this.jsonResponse(res, 200, { success: true })
-        const blob = /^\/api\/blobs\/([^/]+)$/.exec(url.pathname)
-        if (blob && (req.method === 'PUT' || req.method === 'GET')) {
-            void this.handleBlob(req, res, decodeURIComponent(blob[1]), req.method)
-            return
-        }
-        this.jsonResponse(res, 404, { error: 'not found' })
-    }
-
-    /**
-     * Blob store routes as the relay implements them: relay token as Bearer (no PoP on this path),
-     * keys scoped by the token's relaySessionId, 401/400/410/413/429 on refusal, 201 with
-     * `{blobId, sizeBytes}` on PUT, octet-stream or 404 on GET. Bytes are opaque.
-     */
-    private async handleBlob(
-        req: http.IncomingMessage,
-        res: http.ServerResponse,
-        blobId: string,
-        method: 'PUT' | 'GET',
-    ): Promise<void> {
-        const kind = method === 'PUT' ? 'put' : 'get'
-        if (this.blobFailures[kind] > 0) {
-            this.blobFailures[kind]--
-            return this.blobError(res, 503, 'RATE_LIMITED', true)
-        }
-        const token = req.headers.authorization?.match(/^Bearer\s+(\S+)$/i)?.[1]
-        if (!token) return this.blobError(res, 401, 'AUTH_TOKEN_INVALID', false)
-        let claims: RelayTokenClaims
-        try {
-            const decoded = jwt.verify(token, this.options.bmaPublicKeyPem, {
-                algorithms: ['RS256'],
-                audience: RELAY_TOKEN_AUDIENCE,
-                clockTolerance: this.options.tokenGraceS ?? 60,
-            })
-            const parsed = RelayTokenClaimsSchema.safeParse(decoded)
-            if (!parsed.success) return this.blobError(res, 401, 'AUTH_TOKEN_INVALID', false)
-            claims = parsed.data
-        } catch (error) {
-            const expired = error instanceof jwt.TokenExpiredError
-            return this.blobError(res, 401, expired ? 'AUTH_TOKEN_EXPIRED' : 'AUTH_TOKEN_INVALID', expired)
-        }
-        if (!BLOB_ID_PATTERN.test(blobId)) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
-        const session = this.sessions.get(claims.relaySessionId)
-        if (method === 'PUT') {
-            if (!session) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
-            if (session.status === 'closed' || session.status === 'errored')
-                return this.blobError(res, 410, 'SESSION_CLOSED', false)
-            const chunks: Buffer[] = []
-            for await (const chunk of req) chunks.push(chunk as Buffer)
-            const bytes = Buffer.concat(chunks)
-            if (bytes.byteLength === 0) return this.blobError(res, 400, 'PROTOCOL_VIOLATION', false)
-            const maxBlob = this.options.maxBlobBytes ?? 256 * 1024 * 1024
-            if (bytes.byteLength > maxBlob) return this.blobError(res, 413, 'BLOB_TOO_LARGE', false)
-            const store = this.blobStore.get(session.relaySessionId) ?? new Map<string, Buffer>()
-            const used = [...store.values()].reduce((sum, b) => sum + b.byteLength, 0)
-            if (used + bytes.byteLength > (this.options.sessionBlobQuotaBytes ?? 5 * 1024 * 1024 * 1024)) {
-                return this.blobError(res, 429, 'QUOTA_EXCEEDED', false, 'session')
-            }
-            store.set(blobId, bytes)
-            this.blobStore.set(session.relaySessionId, store)
-            this.emit('blobPut', session.relaySessionId, blobId, bytes.byteLength)
-            return this.jsonResponse(res, 201, { blobId, sizeBytes: bytes.byteLength })
-        }
-        const bytes = this.blobStore.get(claims.relaySessionId)?.get(blobId)
-        this.emit('blobGet', claims.relaySessionId, blobId, bytes !== undefined)
-        if (!bytes) return this.jsonResponse(res, 404, { error: 'Not found' })
-        res.writeHead(200, {
-            'content-type': 'application/octet-stream',
-            'content-length': String(bytes.byteLength),
-            'cache-control': 'no-store',
-        })
-        res.end(bytes)
-    }
-
-    private blobError(
-        res: http.ServerResponse,
-        status: number,
-        code: RelayErrorCode,
-        retryable: boolean,
-        scope?: 'session' | 'study',
-    ): void {
-        this.emit('blobRejected', status, code)
-        this.jsonResponse(res, status, { error: { code, retryable, ...(scope ? { scope } : {}) } })
-    }
-
-    private jsonResponse(res: http.ServerResponse, status: number, body: unknown): void {
-        res.writeHead(status, { 'content-type': 'application/json' })
-        res.end(JSON.stringify(body))
     }
 
     // ---- admission --------------------------------------------------------------------------------
 
     private onConnection(ws: WebSocket): void {
-        const conn: Conn = { id: ++this.connSeq, ws, phase: 'hello', missedPongs: 0 }
+        const conn: Conn = { ws, phase: 'hello', missedPongs: 0 }
         this.conns.add(conn)
         ws.binaryType = 'nodebuffer'
         ws.on('message', (data) =>
@@ -368,21 +193,22 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         try {
             frame = decodeFrame(data)
         } catch {
-            return this.reject(conn, 'PROTOCOL_VIOLATION', false, { detail: 'malformed frame' })
+            return this.reject(conn, 'PROTOCOL_VIOLATION', 'malformed frame')
         }
         switch (conn.phase) {
             case 'hello':
-                if (frame.type !== 'HELLO') return this.reject(conn, 'PROTOCOL_VIOLATION', false)
+                if (frame.type !== 'HELLO')
+                    return this.reject(conn, 'PROTOCOL_VIOLATION', `expected HELLO, got ${frame.type}`)
                 return this.onHello(conn, frame.header)
             case 'challenge':
-                if (frame.type !== 'CHALLENGE_RESPONSE') return this.reject(conn, 'PROTOCOL_VIOLATION', false)
+                if (frame.type !== 'CHALLENGE_RESPONSE') return this.reject(conn, 'PROTOCOL_VIOLATION')
                 return this.onChallengeResponse(conn, Buffer.from(frame.header.signature, 'base64url'))
             case 'admitted':
                 return this.onAdmittedFrame(conn, frame)
         }
     }
 
-    private onHello(conn: Conn, hello: { token: string; relaySessionId?: string; role?: RelayRole }): void {
+    private onHello(conn: Conn, hello: { token: string; relaySessionId: string; role: Role }): void {
         let decoded: unknown
         try {
             decoded = jwt.verify(hello.token, this.options.bmaPublicKeyPem, {
@@ -392,25 +218,21 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
                 clockTolerance: this.options.tokenGraceS ?? 60,
             })
         } catch (error) {
-            const expired = error instanceof jwt.TokenExpiredError
-            return this.reject(conn, expired ? 'AUTH_TOKEN_EXPIRED' : 'AUTH_TOKEN_INVALID', true)
+            return this.reject(
+                conn,
+                error instanceof jwt.TokenExpiredError ? 'AUTH_TOKEN_EXPIRED' : 'AUTH_TOKEN_INVALID',
+            )
         }
-        const claims = RelayTokenClaimsSchema.safeParse(decoded)
-        if (!claims.success) return this.reject(conn, 'AUTH_TOKEN_INVALID', false)
-        // A declared session/role must match the token: a session-A token on session B is refused here.
-        if (
-            (hello.relaySessionId !== undefined && hello.relaySessionId !== claims.data.relaySessionId) ||
-            (hello.role !== undefined && hello.role !== claims.data.role)
-        ) {
-            return this.reject(conn, 'AUTH_TOKEN_INVALID', false, {
-                detail: 'declared session or role does not match the token',
-            })
+        const claims = RelayTokenClaims.safeParse(decoded)
+        if (!claims.success) return this.reject(conn, 'AUTH_TOKEN_INVALID')
+        if (hello.relaySessionId !== claims.data.relaySessionId || hello.role !== claims.data.role) {
+            return this.reject(conn, 'AUTH_TOKEN_INVALID', 'token does not match the declared session/role')
         }
         conn.claims = claims.data
-        conn.nonce = randomBytes(32)
+        conn.nonce = newNonce()
         conn.phase = 'challenge'
         conn.challengeTimer = setTimeout(
-            () => this.reject(conn, 'AUTH_POP_FAILED', false, { detail: 'challenge timeout' }),
+            () => this.reject(conn, 'PROTOCOL_VIOLATION', 'challenge timeout'),
             this.options.challengeTimeoutMs ?? 10_000,
         )
         conn.challengeTimer.unref()
@@ -420,10 +242,19 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private onChallengeResponse(conn: Conn, signature: Buffer): void {
         if (conn.challengeTimer) clearTimeout(conn.challengeTimer)
         const claims = conn.claims!
-        const payload = popPayload(conn.nonce!, claims.relaySessionId, claims.role)
-        if (!verifyPop(Buffer.from(claims.popKey, 'base64url'), payload, signature)) {
-            return this.reject(conn, 'AUTH_POP_FAILED', false)
+        let ok: boolean
+        try {
+            ok = verifyPop(
+                popPublicKeyFromRaw(claims.popKey),
+                conn.nonce!,
+                claims.relaySessionId,
+                claims.role,
+                signature,
+            )
+        } catch {
+            ok = false
         }
+        if (!ok) return this.reject(conn, 'AUTH_POP_FAILED')
         this.admit(conn, claims)
     }
 
@@ -434,41 +265,29 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
                 relaySessionId: claims.relaySessionId,
                 studyId: claims.studyId,
                 legId: claims.legId,
-                epoch: 0,
                 status: 'active',
                 sockets: {},
                 fingerprints: {},
-                mailbox: { dstToSrc: [], srcToDst: [] },
-                nextSeq: { dstToSrc: 1, srcToDst: 1 },
                 closeAcks: {},
-                createdAt: Date.now(),
+                forwarded: 0,
             }
             this.sessions.set(claims.relaySessionId, session)
         }
-        if (session.status === 'closed' || session.status === 'errored') {
-            return this.reject(
-                conn,
-                session.status === 'closed' ? 'SESSION_CLOSED' : 'SESSION_ERRORED_DEAD_LETTER',
-                false,
-            )
-        }
+        if (session.status === 'closed' || session.status === 'errored') return this.reject(conn, 'SESSION_CLOSED')
 
         // One live connection per role: a valid re-admission displaces the previous socket.
         const previous = session.sockets[claims.role]
         if (previous && previous !== conn) {
-            this.sendError(previous.ws, { code: 'AUTH_ROLE_OCCUPIED_DISPLACED', retryable: false })
             previous.phase = 'hello'
             delete session.sockets[claims.role]
-            previous.ws.close(CLOSE_CODES.AUTH_ROLE_OCCUPIED_DISPLACED, 'AUTH_ROLE_OCCUPIED_DISPLACED')
+            this.sendError(previous.ws, { code: 'AUTH_ROLE_OCCUPIED_DISPLACED', retryable: false })
+            previous.ws.close(closeCodeFor('AUTH_ROLE_OCCUPIED_DISPLACED'), 'AUTH_ROLE_OCCUPIED_DISPLACED')
             this.emit('displaced', session.relaySessionId, claims.role)
         }
-
         conn.phase = 'admitted'
         session.sockets[claims.role] = conn
-        const newFingerprint = session.fingerprints[claims.role] !== claims.fingerprint
-        const firstAttach = session.fingerprints[claims.role] === undefined
         session.fingerprints[claims.role] = claims.fingerprint
-
+        const peerRole = peerOf(claims.role)
         this.sendFrame(conn.ws, {
             type: 'ADMITTED',
             header: {
@@ -476,33 +295,24 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
                 legId: session.legId,
                 role: claims.role,
                 heartbeatIntervalMs: this.options.heartbeatIntervalMs ?? 30_000,
-                limits: this.limits,
+                peer: this.peerHeader(session, peerRole),
             },
         })
         this.emit('admitted', session.relaySessionId, claims.role, claims.fingerprint)
-
-        if (newFingerprint && !firstAttach) {
-            // A restarted tunnel: everything buffered predates the handshake it is about to run.
-            session.epoch++
-            const purged = session.mailbox.dstToSrc.length + session.mailbox.srcToDst.length
-            session.mailbox = { dstToSrc: [], srcToDst: [] }
-            this.emit('epochPurge', session.relaySessionId, session.epoch, purged)
+        const peer = session.sockets[peerRole]
+        if (peer && peer.ws.readyState === WebSocket.OPEN) {
+            const header = this.peerHeader(session, claims.role)
+            this.sendFrame(peer.ws, { type: 'PEER', header })
+            this.emit('peer', session.relaySessionId, peerRole, header)
         }
-        const peer = session.sockets[peerOf(claims.role)]
-        if (peer && newFingerprint && !firstAttach) {
-            this.sendFrame(peer.ws, { type: 'PEER_REJOINED', header: { peerRole: claims.role, epoch: session.epoch } })
-            this.emit('peerRejoined', session.relaySessionId, claims.role)
-        }
-        // A peer attaching while the session is closing still receives the held CLOSE.
         if (session.status === 'closing' && session.pendingClose && session.pendingClose.from !== claims.role) {
             this.sendFrame(conn.ws, { type: 'CLOSE', header: {}, payload: session.pendingClose.payload })
         }
-        this.redeliver(session, claims.role)
     }
 
-    private reject(conn: Conn, code: RelayErrorCode, retryable: boolean, extra: Partial<ErrorHeader> = {}): void {
+    private reject(conn: Conn, code: ErrorCode, detail?: string): void {
         if (conn.challengeTimer) clearTimeout(conn.challengeTimer)
-        this.sendError(conn.ws, { code, retryable, ...extra })
+        this.sendError(conn.ws, { code, retryable: code === 'AUTH_TOKEN_EXPIRED', ...(detail ? { detail } : {}) })
         this.emit('rejected', code)
         conn.ws.close(closeCodeFor(code), code)
     }
@@ -512,7 +322,14 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         if (conn.challengeTimer) clearTimeout(conn.challengeTimer)
         if (conn.phase !== 'admitted' || !conn.claims) return
         const session = this.sessions.get(conn.claims.relaySessionId)
-        if (session && session.sockets[conn.claims.role] === conn) delete session.sockets[conn.claims.role]
+        if (!session || session.sockets[conn.claims.role] !== conn) return
+        delete session.sockets[conn.claims.role]
+        const peer = session.sockets[peerOf(conn.claims.role)]
+        if (peer && peer.ws.readyState === WebSocket.OPEN) {
+            const header: PeerHeader = { attached: false, fingerprint: session.fingerprints[conn.claims.role] }
+            this.sendFrame(peer.ws, { type: 'PEER', header })
+            this.emit('peer', session.relaySessionId, peerOf(conn.claims.role), header)
+        }
     }
 
     // ---- admitted traffic -------------------------------------------------------------------------
@@ -520,7 +337,7 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private onAdmittedFrame(conn: Conn, frame: Frame): void {
         const claims = conn.claims!
         const session = this.sessions.get(claims.relaySessionId)
-        if (!session) return
+        if (!session || session.sockets[claims.role] !== conn) return
         const role = claims.role
         const dropKey = `${role}:${frame.type}`
         const drops = this.frameDrops.get(dropKey) ?? 0
@@ -530,21 +347,15 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
         switch (frame.type) {
             case 'DATA':
-                return this.onData(session, role, frame.header, frame.payload)
             case 'ACK':
-                return this.onAck(session, role, frame.header.messageId)
-            case 'NACK_DISCARD':
-                return this.onNack(session, role, frame.header.messageId)
-            case 'HANDSHAKE': {
-                const peer = session.sockets[peerOf(role)]
-                if (peer && peer.ws.readyState === WebSocket.OPEN) this.sendFrame(peer.ws, frame)
-                else this.emit('handshakeDropped', session.relaySessionId, peerOf(role))
-                return
-            }
+            case 'NACK':
+            case 'HANDSHAKE':
+                if (frame.type === 'DATA' && session.status !== 'active' && session.status !== 'closing') return
+                return this.forward(session, role, frame)
             case 'CLOSE':
-                return this.onCloseRequest(session, role, frame.payload)
+                return this.onCloseRequest(session, role, frame)
             case 'CLOSE_ACK':
-                return this.onCloseAck(session, role)
+                return this.onCloseAck(session, role, frame)
             default:
                 this.sendError(conn.ws, {
                     code: 'PROTOCOL_VIOLATION',
@@ -554,192 +365,72 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         }
     }
 
-    private onData(session: Session, sender: RelayRole, header: DataHeader, payload: Buffer): void {
-        if (session.status !== 'active') return
-        const direction = directionFor(sender)
-        const conn = session.sockets[sender]!
-        if (payload.byteLength > this.limits.maxChunkBytes) {
-            return this.sendError(conn.ws, { code: 'FRAME_TOO_LARGE', retryable: false, messageId: header.messageId })
+    private forward(session: Session, from: Role, frame: Frame): void {
+        const peer = session.sockets[peerOf(from)]
+        if (peer && peer.ws.readyState === WebSocket.OPEN) {
+            this.sendFrame(peer.ws, frame)
+            session.forwarded++
+            this.emit('forwarded', session.relaySessionId, from, frame)
+        } else {
+            this.emit('dropped', session.relaySessionId, from, frame)
         }
-        if (header.chunkIndex === 0) {
-            const leads = session.mailbox[direction].filter((i) => i.chunkIndex === 0 && i.msgState !== 'consumed')
-            const bytes = leads.reduce((sum, i) => sum + i.sizeBytes, 0)
-            if (leads.length >= this.limits.windowMsgs || bytes + header.sizeBytes > this.limits.windowBytes) {
-                this.emit('backpressure', session.relaySessionId, direction, header.messageId)
-                return this.sendError(conn.ws, { code: 'BACKPRESSURE', retryable: true, messageId: header.messageId })
-            }
-        }
-        // Idempotent append: a tunnel re-offers un-ACKed chunks after a reconnect (it cannot know
-        // which ones reached us); a chunk already held for (messageId, chunkIndex) is ignored.
-        if (
-            session.mailbox[direction].some(
-                (i) => i.messageId === header.messageId && i.chunkIndex === header.chunkIndex,
-            )
-        ) {
-            this.pushReady(session, peerOf(sender))
-            return
-        }
-        const item: MailboxItem = {
-            seq: session.nextSeq[direction]++,
-            messageId: header.messageId,
-            chunkIndex: header.chunkIndex,
-            chunkCount: header.chunkCount,
-            epochTag: header.epochTag,
-            respondsTo: header.respondsTo,
-            sizeBytes: header.sizeBytes,
-            payload: Buffer.from(payload),
-            msgState: 'buffered',
-            deliveryCount: 0,
-            createdAt: Date.now(),
-        }
-        session.mailbox[direction].push(item)
-        this.emit('data', session.relaySessionId, direction, header.messageId, header.chunkIndex)
-        // store-then-push: only when the whole message is present do we push it, in seq order
-        this.pushReady(session, peerOf(sender))
-    }
-
-    /** Push every complete, not-yet-delivered message toward `receiver` if its socket is live. */
-    private pushReady(session: Session, receiver: RelayRole): void {
-        const peer = session.sockets[receiver]
-        if (!peer || peer.ws.readyState !== WebSocket.OPEN) return
-        const direction = receivesFrom(receiver)
-        for (const lead of session.mailbox[direction].filter((i) => i.chunkIndex === 0 && i.msgState === 'buffered')) {
-            const chunks = session.mailbox[direction].filter((i) => i.messageId === lead.messageId)
-            if (chunks.length < lead.chunkCount) continue
-            this.deliver(session, receiver, lead, chunks)
-        }
-    }
-
-    private deliver(session: Session, receiver: RelayRole, lead: MailboxItem, chunks: MailboxItem[]): void {
-        const peer = session.sockets[receiver]
-        if (!peer) return
-        lead.deliveryCount++
-        if (lead.deliveryCount > (this.options.maxDeliveries ?? 5)) return this.deadLetter(session, lead.messageId)
-        if (lead.msgState === 'buffered') lead.msgState = 'delivered'
-        for (const chunk of [...chunks].sort((a, b) => a.chunkIndex - b.chunkIndex)) {
-            this.sendFrame(peer.ws, {
-                type: 'DATA',
-                header: {
-                    messageId: chunk.messageId,
-                    chunkIndex: chunk.chunkIndex,
-                    chunkCount: chunk.chunkCount,
-                    epochTag: chunk.epochTag,
-                    ...(chunk.respondsTo ? { respondsTo: chunk.respondsTo } : {}),
-                    sizeBytes: chunk.sizeBytes,
-                    seq: chunk.seq,
-                },
-                payload: chunk.payload,
-            })
-        }
-        this.emit('delivered', session.relaySessionId, receivesFrom(receiver), lead.messageId, lead.deliveryCount)
-    }
-
-    /** On (re)attach: redeliver every complete un-consumed message toward this role, in seq order. */
-    private redeliver(session: Session, receiver: RelayRole): void {
-        const direction = receivesFrom(receiver)
-        for (const lead of session.mailbox[direction].filter((i) => i.chunkIndex === 0 && i.msgState !== 'consumed')) {
-            const chunks = session.mailbox[direction].filter((i) => i.messageId === lead.messageId)
-            if (chunks.length < lead.chunkCount) continue
-            this.deliver(session, receiver, lead, chunks)
-            if (session.status !== 'active') return
-        }
-    }
-
-    private onAck(session: Session, acker: RelayRole, messageId: string): void {
-        const direction = receivesFrom(acker)
-        const lead = session.mailbox[direction].find((i) => i.messageId === messageId && i.chunkIndex === 0)
-        // Forward the end-to-end ACK to the sender so it can evict its outbox (v2 §7.1 step 6).
-        const sender = session.sockets[peerOf(acker)]
-        if (sender && sender.ws.readyState === WebSocket.OPEN)
-            this.sendFrame(sender.ws, { type: 'ACK', header: { messageId } })
-        if (!lead) return void this.emit('ack', session.relaySessionId, messageId, 'noop')
-        const isQuery = direction === 'dstToSrc' && lead.respondsTo === undefined
-        if (isQuery) {
-            // A query: consumed but retained until its correlated response completes stage two.
-            lead.msgState = 'consumed'
-            this.emit('ack', session.relaySessionId, messageId, 'consumed')
-            return
-        }
-        // Anything else is deleted on ACK; a response also releases the retained query it answers.
-        this.remove(session, direction, messageId)
-        if (lead.respondsTo) this.remove(session, direction === 'dstToSrc' ? 'srcToDst' : 'dstToSrc', lead.respondsTo)
-        this.emit('ack', session.relaySessionId, messageId, 'deleted')
-    }
-
-    private onNack(session: Session, receiver: RelayRole, messageId: string): void {
-        this.remove(session, receivesFrom(receiver), messageId)
-        this.emit('nack', session.relaySessionId, messageId)
-    }
-
-    private remove(session: Session, direction: Direction, messageId: string): void {
-        session.mailbox[direction] = session.mailbox[direction].filter((i) => i.messageId !== messageId)
-    }
-
-    private deadLetter(session: Session, messageId: string): void {
-        session.status = 'errored'
-        this.emit('deadLetter', session.relaySessionId, messageId)
-        this.endSession(session, { code: 'SESSION_ERRORED_DEAD_LETTER', retryable: false, messageId })
     }
 
     // ---- close ------------------------------------------------------------------------------------
 
-    private onCloseRequest(session: Session, requester: RelayRole, payload: Buffer): void {
+    private onCloseRequest(session: Session, requester: Role, frame: Extract<Frame, { type: 'CLOSE' }>): void {
         if (session.status !== 'active' && session.status !== 'closing') return
         const first = session.status === 'active'
         session.status = 'closing'
-        // The requester's own CLOSE is its acknowledgement; only the peer's CLOSE_ACK is awaited.
-        session.closeAcks[requester] = true
-        session.pendingClose = { from: requester, payload: Buffer.from(payload) }
+        session.closeAcks[requester] = true // the requester's own CLOSE is its acknowledgement
+        session.pendingClose = { from: requester, payload: Buffer.from(frame.payload) }
         if (first) this.emit('close', session.relaySessionId, 'requested')
-        const peer = session.sockets[peerOf(requester)]
-        if (peer && peer.ws.readyState === WebSocket.OPEN)
-            this.sendFrame(peer.ws, { type: 'CLOSE', header: {}, payload })
+        this.forward(session, requester, frame)
         if (!session.closeTimer) {
             session.closeTimer = setTimeout(() => {
                 this.emit('close', session.relaySessionId, 'timeout')
-                this.finishClose(session)
+                this.endSession(session, 'closed', 'SESSION_CLOSED')
+                this.emit('close', session.relaySessionId, 'purged')
             }, this.options.closeTimeoutMs ?? 30_000)
             session.closeTimer.unref()
         }
     }
 
-    private onCloseAck(session: Session, acker: RelayRole): void {
+    private onCloseAck(session: Session, acker: Role, frame: Extract<Frame, { type: 'CLOSE_ACK' }>): void {
         if (session.status !== 'closing') return
         session.closeAcks[acker] = true
         this.emit('close', session.relaySessionId, 'acked')
-        // The requester sees the peer's acknowledgement before the purge closes its socket.
-        const requester = session.sockets[peerOf(acker)]
-        if (requester && requester.ws.readyState === WebSocket.OPEN)
-            this.sendFrame(requester.ws, { type: 'CLOSE_ACK', header: {} })
-        if (session.closeAcks.source && session.closeAcks.destination) this.finishClose(session)
+        this.forward(session, acker, frame)
+        if (session.closeAcks.source && session.closeAcks.destination) {
+            this.endSession(session, 'closed', 'SESSION_CLOSED')
+            this.emit('close', session.relaySessionId, 'purged')
+        }
     }
 
-    private finishClose(session: Session): void {
+    /** Notify live sockets, close them, forget the session. */
+    private endSession(session: Session, status: 'closed' | 'errored', code: ErrorCode): void {
         if (session.closeTimer) clearTimeout(session.closeTimer)
         session.closeTimer = undefined
-        session.status = 'closed'
-        this.endSession(session, { code: 'SESSION_CLOSED', retryable: false })
-        this.emit('close', session.relaySessionId, 'purged')
-    }
-
-    /** Purge mailboxes and blobs, notify live sockets, and close them. */
-    private endSession(session: Session, error: ErrorHeader): void {
-        session.mailbox = { dstToSrc: [], srcToDst: [] }
-        const purged = this.blobStore.get(session.relaySessionId)?.size ?? 0
-        this.blobStore.delete(session.relaySessionId)
-        if (purged) this.emit('blobsPurged', session.relaySessionId, purged)
+        session.status = status
+        session.pendingClose = undefined
         for (const role of ['source', 'destination'] as const) {
             const conn = session.sockets[role]
             if (!conn) continue
             if (conn.ws.readyState === WebSocket.OPEN) {
-                this.sendError(conn.ws, error)
-                conn.ws.close(closeCodeFor(error.code), error.code)
+                this.sendError(conn.ws, { code, retryable: false })
+                conn.ws.close(closeCodeFor(code), code)
             }
             delete session.sockets[role]
         }
     }
 
     // ---- plumbing ---------------------------------------------------------------------------------
+
+    private peerHeader(session: Session, role: Role): PeerHeader {
+        const conn = session.sockets[role]
+        const fingerprint = session.fingerprints[role]
+        return { attached: !!conn && conn.ws.readyState === WebSocket.OPEN, ...(fingerprint ? { fingerprint } : {}) }
+    }
 
     private pingAll(): void {
         if (!this.pingEnabled) return
@@ -761,10 +452,4 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
     private sendError(ws: WebSocket, header: ErrorHeader): void {
         this.sendFrame(ws, { type: 'ERROR', header })
     }
-}
-
-export const startFakeRelay = async (options: Partial<FakeRelayOptions> & { bmaPublicKeyPem: string }) => {
-    const relay = new FakeRelay(options)
-    await relay.start()
-    return relay
 }

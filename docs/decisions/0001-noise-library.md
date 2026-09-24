@@ -50,14 +50,19 @@ frames directly but mailboxes data.
 
 ## Why an explicit transport counter
 
-The relay redelivers byte-identical frames within an epoch (un-ACKed items after a reconnect,
-v2 §7.3). Under Noise's implicit nonce a redelivered frame is undecryptable and would be
-NACK-discarded — wrong, it is a legitimate duplicate the receiver must re-ACK by `messageId`.
-With the counter in the frame the receiver classifies a frame as fresh, replay, or too old
-_before_ touching the key, decrypts fresh frames, and lets the reliability layer re-ACK
-replays by the relay header's `messageId`. Only authenticated frames advance the window.
-Retransmissions from the sender's outbox are fresh frames (new counter, same AEAD-protected
-`messageId`), exactly as v2 §7.3 requires.
+The relay is a pass-through and never redelivers a frame, but a WebSocket can drop with frames
+in flight: whatever was buffered on the dead socket is lost, and after the re-dial the sender's
+outbox retransmits from its own copy. Under Noise's implicit nonce the receiver's counter would
+be desynchronised by the first lost frame and every later frame in the epoch would fail
+authentication. With the counter in the frame the receiver classifies a frame as fresh, replay,
+or too old before touching the key, and a gap is simply a gap. Duplicates of a _message_ are
+handled one layer up by the AEAD-protected `messageId`. Only authenticated frames advance the
+window. Retransmissions from the sender's outbox are fresh frames (new counter, same
+AEAD-protected `messageId`), so a replayed ciphertext can never be mistaken for one.
+
+_2026-09-24: rewritten when the relay became memory-only (fusion-program DECISIONS.md, same
+date). The earlier text justified the counter by the relay's byte-identical redelivery of
+un-ACKed items; that redelivery no longer exists._
 
 ## Rejected
 

@@ -1,4 +1,4 @@
-import { close } from '@/http/server'
+import { close } from '@/http'
 import { TERMINAL_STATES, type TunnelState } from '@/lib/lifecycle'
 import { log } from '@/lib/logger'
 import type { Tunnel } from '@/tunnel'

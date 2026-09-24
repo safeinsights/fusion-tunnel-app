@@ -1,12 +1,12 @@
 import { EventEmitter } from 'node:events'
 import type { Tuning } from '@/config'
-import type { Channel, VerifiedPeer } from '@/lib/channel'
+import type { Channel } from '@/lib/channel'
 import type { Exchange } from '@/lib/exchange'
 import type { Identity } from '@/lib/identity'
 import type { Lifecycle, TerminalCode } from '@/lib/lifecycle'
 import { log, errorFields } from '@/lib/logger'
 import { refreshDelayMs } from '@/lib/bma/credential'
-import { verifyPeerKey, type PeerKeyRejection } from '@/lib/bma/verify-peer-key'
+import { verifyPeerKey, type PeerKeyRejection, type VerifiedPeer } from '@/lib/bma/verify-peer-key'
 import type { CapsMeter } from '@/reliability/caps'
 import {
     CredentialResponseSchema,
@@ -18,9 +18,9 @@ import type { ConfigurationBundle } from '@/schemas/provisioning'
 
 // Every Management-App interaction the tunnel performs on its own behalf (v2 §4.3, §5, §12),
 // authenticated by the delegated tunnel credential: the peer-key poll (drives CONFIGURED →
-// PEER_KEY_VERIFIED, and the re-fetch after PEER_REJOINED), relay-token pre-fetch before
-// expiry, credential refresh, and periodic content-free status reports carrying legId and the
-// cap counters. Egress from this client goes to exactly one endpoint: the BMA.
+// PEER_KEY_VERIFIED, and the re-fetch after a peer restart), relay-token pre-fetch before expiry,
+// credential refresh, and periodic content-free status reports carrying legId and the cap
+// counters. Egress from this client goes to exactly one endpoint: the BMA.
 
 export type BmaClientDeps = {
     bundle: ConfigurationBundle
@@ -36,11 +36,7 @@ export type BmaClientDeps = {
 }
 
 export interface BmaClientEvents {
-    peerKeyVerified: [peer: VerifiedPeer]
     peerKeyRejected: [reason: PeerKeyRejection]
-    relayTokenRefreshed: [expiresAt: string]
-    credentialRefreshed: [expiresAt: string]
-    statusReported: [report: StatusReport, status: number]
     requestFailed: [operation: string, error: unknown]
 }
 
@@ -51,13 +47,10 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
     private requireNewer = false
     private peerKeyRejected = false
     private peerGeneration: number | undefined
-    private peerKeyTimer: NodeJS.Timeout | null = null
-    private relayTokenTimer: NodeJS.Timeout | null = null
-    private credentialTimer: NodeJS.Timeout | null = null
+    private readonly timers = new Map<'peerKey' | 'relayToken' | 'credential', NodeJS.Timeout>()
     private statusTimer: NodeJS.Timeout | null = null
     private stopped = false
     private polling = false
-    private lastSeqReceived: number | undefined
     private messagesSent = 0
     private messagesAcked = 0
     private messagesReceived = 0
@@ -81,10 +74,6 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         return this.relayToken
     }
 
-    currentCredential(): string {
-        return this.credential
-    }
-
     start(): void {
         this.deps.channel.on('delivery', (event) => {
             if (event.type === 'sent' && !event.resend) this.messagesSent++
@@ -93,9 +82,6 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
                 this.messagesReceived++
                 if (this.deps.caps?.nearLimit()) void this.report('near_limit')
             }
-        })
-        this.deps.channel.relay.on('frame', (frame) => {
-            if (frame.type === 'DATA' && frame.header.seq !== undefined) this.lastSeqReceived = frame.header.seq
         })
         this.deps.lifecycle.onTransition((transition) => {
             if (transition.to === 'CHANNEL_UP') this.stopPeerKeyPoll()
@@ -107,8 +93,8 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
             }
         })
         this.startPeerKeyPoll()
-        this.scheduleRelayTokenRefresh()
-        this.scheduleCredentialRefresh()
+        this.scheduleRefresh('relayToken')
+        this.scheduleRefresh('credential')
         this.statusTimer = setInterval(() => void this.report('interval'), this.deps.tuning.statusIntervalMs)
         this.statusTimer.unref()
     }
@@ -142,8 +128,7 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
     }
 
     private stopPeerKeyPoll(): void {
-        if (this.peerKeyTimer) clearTimeout(this.peerKeyTimer)
-        this.peerKeyTimer = null
+        this.clearTimer('peerKey')
         this.polling = false
     }
 
@@ -169,10 +154,9 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
                             legId: this.deps.bundle.legId,
                             generation: verdict.peer.generation,
                         })
-                        this.emit('peerKeyVerified', verdict.peer)
                         this.deps.verifiedPeer(verdict.peer)
                         // Keep watching for a strictly newer key until the channel is up: a peer re-provisioned
-                        // before it ever attached publishes a new generation without any PEER_REJOINED reaching us.
+                        // before it ever attached publishes a new generation without any presence change reaching us.
                         this.requireNewer = true
                         if (this.deps.lifecycle.state === 'CHANNEL_UP') {
                             this.polling = false
@@ -192,8 +176,7 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
             log.warn('bma.peer_key_fetch_failed', errorFields(error))
         }
         if (this.stopped || !this.polling) return
-        this.peerKeyTimer = setTimeout(() => void this.pollPeerKey(), this.deps.tuning.peerKeyPollMs)
-        this.peerKeyTimer.unref()
+        this.setTimer('peerKey', () => void this.pollPeerKey(), this.deps.tuning.peerKeyPollMs)
     }
 
     private rejectPeerKey(reason: PeerKeyRejection, detail: string): void {
@@ -205,64 +188,40 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
 
     // ---- tokens --------------------------------------------------------------------------
 
-    private scheduleRelayTokenRefresh(): void {
-        if (this.relayTokenTimer) clearTimeout(this.relayTokenTimer)
-        const delay = refreshDelayMs(this.relayToken, this.now(), this.deps.tuning.tokenRefreshLeadMs)
-        if (delay === undefined) {
-            log.warn('bma.relay_token_without_exp', {})
-            return
-        }
-        this.relayTokenTimer = setTimeout(() => void this.refreshRelayToken(), delay)
-        this.relayTokenTimer.unref()
+    /** Both BMA-issued JWTs are refreshed the same way: `lead` before their `exp`, retried on the poll cadence. */
+    private scheduleRefresh(which: 'relayToken' | 'credential', delayMs?: number): void {
+        const token = which === 'relayToken' ? this.relayToken : this.credential
+        const delay = delayMs ?? refreshDelayMs(token, this.now(), this.deps.tuning.tokenRefreshLeadMs)
+        if (delay === undefined) return log.warn('bma.token_without_exp', { which })
+        this.setTimer(which, () => void this.refresh(which), delay)
     }
 
-    private async refreshRelayToken(): Promise<void> {
+    private async refresh(which: 'relayToken' | 'credential'): Promise<void> {
         if (this.stopped) return
         try {
-            const res = await this.get(`/tunnel/relay-session?legId=${encodeURIComponent(this.deps.bundle.legId)}`)
-            if (res.status !== 200) throw new Error(`relay-session returned ${res.status}`)
-            const parsed = RelaySessionResponseSchema.parse(await res.json())
-            if (parsed.relaySessionId !== this.deps.bundle.relay.sessionId || parsed.role !== this.deps.bundle.role) {
-                throw new Error('relay-session response does not match the bundle')
+            if (which === 'relayToken') {
+                const res = await this.get(`/tunnel/relay-session?legId=${encodeURIComponent(this.deps.bundle.legId)}`)
+                if (res.status !== 200) throw new Error(`relay-session returned ${res.status}`)
+                const parsed = RelaySessionResponseSchema.parse(await res.json())
+                if (
+                    parsed.relaySessionId !== this.deps.bundle.relay.sessionId ||
+                    parsed.role !== this.deps.bundle.role
+                ) {
+                    throw new Error('relay-session response does not match the bundle')
+                }
+                this.relayToken = parsed.relayToken
+                log.info('bma.relay_token_refreshed', { expiresAt: parsed.relayTokenExpiresAt })
+            } else {
+                const res = await this.post('/tunnel/credential', {})
+                if (res.status !== 200) throw new Error(`credential returned ${res.status}`)
+                this.credential = CredentialResponseSchema.parse(await res.json()).credential
+                log.info('bma.credential_refreshed', {})
             }
-            this.relayToken = parsed.relayToken
-            log.info('bma.relay_token_refreshed', { expiresAt: parsed.relayTokenExpiresAt })
-            this.emit('relayTokenRefreshed', parsed.relayTokenExpiresAt)
-            this.scheduleRelayTokenRefresh()
+            this.scheduleRefresh(which)
         } catch (error) {
-            this.emit('requestFailed', 'relay-session', error)
-            log.warn('bma.relay_token_refresh_failed', errorFields(error))
-            this.relayTokenTimer = setTimeout(() => void this.refreshRelayToken(), this.deps.tuning.peerKeyPollMs)
-            this.relayTokenTimer.unref()
-        }
-    }
-
-    private scheduleCredentialRefresh(): void {
-        if (this.credentialTimer) clearTimeout(this.credentialTimer)
-        const delay = refreshDelayMs(this.credential, this.now(), this.deps.tuning.tokenRefreshLeadMs)
-        if (delay === undefined) {
-            log.warn('bma.credential_without_exp', {})
-            return
-        }
-        this.credentialTimer = setTimeout(() => void this.refreshCredential(), delay)
-        this.credentialTimer.unref()
-    }
-
-    private async refreshCredential(): Promise<void> {
-        if (this.stopped) return
-        try {
-            const res = await this.post('/tunnel/credential', {})
-            if (res.status !== 200) throw new Error(`credential returned ${res.status}`)
-            const parsed = CredentialResponseSchema.parse(await res.json())
-            this.credential = parsed.credential
-            log.info('bma.credential_refreshed', { expiresAt: parsed.expiresAt })
-            this.emit('credentialRefreshed', parsed.expiresAt)
-            this.scheduleCredentialRefresh()
-        } catch (error) {
-            this.emit('requestFailed', 'credential', error)
-            log.warn('bma.credential_refresh_failed', errorFields(error))
-            this.credentialTimer = setTimeout(() => void this.refreshCredential(), this.deps.tuning.peerKeyPollMs)
-            this.credentialTimer.unref()
+            this.emit('requestFailed', which, error)
+            log.warn('bma.refresh_failed', { which, ...errorFields(error) })
+            this.scheduleRefresh(which, this.deps.tuning.peerKeyPollMs)
         }
     }
 
@@ -287,7 +246,6 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
             messagesSent: this.messagesSent,
             messagesAcked: this.messagesAcked,
             messagesReceived: this.messagesReceived,
-            ...(this.lastSeqReceived !== undefined ? { lastSeqReceived: this.lastSeqReceived } : {}),
             roundsCompleted: exchange.stats().roundsCompleted,
             outboxDepth: delivery.outboxDepth,
             pendingAcks: delivery.pendingAcks,
@@ -303,7 +261,6 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         const report = this.buildReport(reason, terminal)
         try {
             const res = await this.post('/tunnel/status', report)
-            this.emit('statusReported', report, res.status)
             if (res.status >= 300) log.warn('bma.status_report_rejected', { status: res.status, reason })
         } catch (error) {
             this.emit('requestFailed', 'status', error)
@@ -333,11 +290,23 @@ export class BmaClient extends EventEmitter<BmaClientEvents> {
         })
     }
 
+    private setTimer(name: 'peerKey' | 'relayToken' | 'credential', fn: () => void, delayMs: number): void {
+        this.clearTimer(name)
+        const timer = setTimeout(fn, delayMs)
+        timer.unref()
+        this.timers.set(name, timer)
+    }
+
+    private clearTimer(name: 'peerKey' | 'relayToken' | 'credential'): void {
+        const timer = this.timers.get(name)
+        if (timer) clearTimeout(timer)
+        this.timers.delete(name)
+    }
+
     private clearTimers(): void {
-        for (const timer of [this.peerKeyTimer, this.relayTokenTimer, this.credentialTimer])
-            if (timer) clearTimeout(timer)
+        for (const name of [...this.timers.keys()]) this.clearTimer(name)
         if (this.statusTimer) clearInterval(this.statusTimer)
-        this.peerKeyTimer = this.relayTokenTimer = this.credentialTimer = this.statusTimer = null
+        this.statusTimer = null
         this.polling = false
     }
 }

@@ -14,6 +14,7 @@ describe('createTunnel', () => {
         expect(tunnel.exchange).toBeUndefined()
         expect(tunnel.identity.publicKey).toHaveLength(32)
         expect(tunnel.server.listening).toBe(false)
+        tunnel.stop()
     })
 
     it('configure is idempotent for an equal bundle regardless of key order and conflicts otherwise', () => {
@@ -22,6 +23,7 @@ describe('createTunnel', () => {
         expect(tunnel.configure(bundle)).toBe('configured')
         expect(tunnel.lifecycle.state).toBe('CONFIGURED')
         expect(tunnel.exchange?.role).toBe('source')
+        expect(tunnel.caps).toBeDefined()
         const reordered = {
             ...bundle,
             relay: { token: bundle.relay.token, sessionId: bundle.relay.sessionId, endpoint: bundle.relay.endpoint },
@@ -29,6 +31,7 @@ describe('createTunnel', () => {
         expect(tunnel.configure(reordered)).toBe('unchanged')
         expect(tunnel.configure(makeBundle({ role: 'source', legId: 'leg-b' }))).toBe('conflict')
         expect(tunnel.lifecycle.history).toHaveLength(1)
+        tunnel.stop()
     })
 
     it('refuses configuration once terminal', () => {
@@ -49,11 +52,12 @@ describe('createTunnel', () => {
         tunnel.exchange!.deliver({
             kind: 'response',
             messageId: '3f2b6f7c-1f1c-4e3e-9a4b-1c9d0e8f7a6b',
-            correlationId: initial.sent[0].correlationId,
+            correlationId: initial.sent[0]!.correlationId,
             payload: 1,
         })
-        tunnel.exchange!.ack('3f2b6f7c-1f1c-4e3e-9a4b-1c9d0e8f7a6b')
+        tunnel.exchange!.consumed('3f2b6f7c-1f1c-4e3e-9a4b-1c9d0e8f7a6b')
         expect(replacement.acks).toEqual(['3f2b6f7c-1f1c-4e3e-9a4b-1c9d0e8f7a6b'])
+        tunnel.stop()
     })
 
     it('wakes held long-polls when the session starts closing and logs transitions content-free', async () => {
@@ -62,8 +66,8 @@ describe('createTunnel', () => {
         const tunnel = createTunnel(loadConfig({ PORT: '0' }), { bma: null })
         tunnel.configure(makeBundle())
         driveToChannelUp(tunnel)
-        const held = tunnel.responseWaiters.wait('cid', 5_000)
-        const heldQuery = tunnel.queryWaiters.wait('next', 5_000)
+        const held = tunnel.waiters.wait('cid', 5_000)
+        const heldQuery = tunnel.waiters.wait('next', 5_000)
         tunnel.complete('test')
         await expect(held).resolves.toBeUndefined()
         await expect(heldQuery).resolves.toBeUndefined()
@@ -78,6 +82,7 @@ describe('createTunnel', () => {
         })
         expect(lines.join('\n')).not.toContain('localApiToken')
         expect(lines.join('\n')).not.toContain('relay-token')
+        tunnel.stop()
     })
 
     it('uses an injected identity and clock', () => {
@@ -86,6 +91,10 @@ describe('createTunnel', () => {
         const tunnel = createTunnel(loadConfig({ PORT: '0' }), { identity: other.identity, now: () => at, bma: null })
         expect(tunnel.identity).toBe(other.identity)
         tunnel.configure(makeBundle())
-        expect(tunnel.lifecycle.history[0].at).toBe(at)
+        expect(tunnel.lifecycle.history[0]!.at).toBe(at)
+        expect(() =>
+            other.verifiedPeer({ publicKey: Buffer.alloc(32), connectionId: 'x', generation: 1, fingerprint: 'f' }),
+        ).toThrow(/not configured/)
+        tunnel.stop()
     })
 })

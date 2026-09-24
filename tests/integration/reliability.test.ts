@@ -1,24 +1,13 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { v4 as uuidv4 } from 'uuid'
-import { startPair, runRound, until, type Pair } from '@/testing/pair-harness'
+import { randomUUID } from 'node:crypto'
+import { startPair, runRound, until, poll200, type Pair } from '@/testing/pair-harness'
 import { encodeChunkHeader } from '@/lib/noise/chunk-header'
 import { pad, capacityOf } from '@/reliability/padding'
-import { declaredSizeFor } from '@/reliability/chunker'
-import { TUNING_DEFAULTS } from '@/config'
+import { PAD_BUCKETS } from '@/schemas/channel'
 import type { DeliveryEvent } from '@/reliability/delivery'
-import type { ApiResult } from '@/testing/fixtures'
+import type { Frame } from '@/relay-protocol'
 
 const T = 20_000
-
-const poll200 = (call: () => Promise<ApiResult>, label: string, timeoutMs = 5000) =>
-    until(
-        async () => {
-            const res = await call()
-            return res.status === 200 ? res.body : undefined
-        },
-        timeoutMs,
-        label,
-    )
 
 describe('two tunnels through the fake relay', () => {
     let pair: Pair
@@ -28,7 +17,7 @@ describe('two tunnels through the fake relay', () => {
     })
 
     it(
-        'runs N rounds with payloads from one byte to many chunks and leaves nothing in the relay',
+        'runs N rounds with payloads from one byte to many chunks; the relay forwards and keeps nothing',
         { timeout: T },
         async () => {
             pair = await startPair()
@@ -47,81 +36,72 @@ describe('two tunnels through the fake relay', () => {
                 expect(result.response.payload).toEqual({ echoed: i, blob: 'r'.repeat(size) })
                 expect(result.response.budget).toMatchObject({ roundsUsed: i + 1 })
             }
-            await until(() =>
-                pair.relay.messages(pair.relaySessionId, 'dstToSrc').length +
-                    pair.relay.messages(pair.relaySessionId, 'srcToDst').length ===
-                0
-                    ? true
-                    : undefined,
-            )
             await until(() => (pair.source.tunnel.channel!.delivery.stats().outboxDepth === 0 ? true : undefined))
-            expect(pair.destination.tunnel.channel!.delivery.stats().outboxDepth).toBe(0)
+            await until(() => (pair.destination.tunnel.channel!.delivery.stats().outboxDepth === 0 ? true : undefined))
             expect(pair.destination.tunnel.exchange!.stats().inFlight).toBe(false)
+            expect(pair.relay.session(pair.relaySessionId)!.forwarded).toBeGreaterThan(sizes.length * 4)
         },
     )
 
-    it('declares wire sizes that match the bucket table and pads frames onto buckets', { timeout: T }, async () => {
-        pair = await startPair()
-        await pair.connect()
-        const payload = { blob: 'x'.repeat(5000) }
-        const submitted = await pair.dstApi().post('/v1/request', { payload })
-        expect(submitted.status).toBe(202)
-        const lead = await until(() => pair.relay.messages(pair.relaySessionId, 'dstToSrc')[0])
-        const plaintextLength = Buffer.byteLength(
-            JSON.stringify({ v: 1, kind: 'query', correlationId: submitted.body.correlationId, payload }),
-        )
-        expect(lead.sizeBytes).toBe(declaredSizeFor(plaintextLength, TUNING_DEFAULTS.padBuckets))
-        expect(TUNING_DEFAULTS.padBuckets).toContain(lead.payload.byteLength)
-    })
-
     it(
-        'converges a lost stage-two ACK: the relay redelivers, the source re-ACKs, the RC sees the query once',
+        'pads every frame onto a bucket and never puts the correlationId in relay-visible metadata',
         { timeout: T },
         async () => {
             pair = await startPair()
             await pair.connect()
-            pair.relay.dropNextAcks('source', 1)
+            const seen: Frame[] = []
+            pair.relay.on('forwarded', (_s, _from, frame) => seen.push(frame))
+            const submitted = await pair.dstApi().post('/v1/request', { payload: { blob: 'x'.repeat(5000) } })
+            expect(submitted.status).toBe(202)
+            const data = await until(() => seen.find((f): f is Extract<Frame, { type: 'DATA' }> => f.type === 'DATA'))
+            expect(PAD_BUCKETS).toContain(data.payload.byteLength)
+            expect(JSON.stringify(data.header)).not.toContain(submitted.body.correlationId)
+            expect(Object.keys(data.header).sort()).toEqual(['chunkCount', 'chunkIndex', 'messageId'])
+        },
+    )
+
+    it(
+        'converges a lost end-to-end ACK: the retransmit re-offers, the source re-ACKs, the RC sees the query once',
+        { timeout: T },
+        async () => {
+            pair = await startPair({ env: { FUSION_RETRANSMIT_MS: '100' } })
+            await pair.connect()
+            pair.relay.dropNext('source', 'ACK', 1)
             const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 1 } })).body
             const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
-            expect((await pair.srcApi().post(`/v1/messages/${query.messageId}/ack`)).status).toBe(200)
-            expect(pair.relay.messages(pair.relaySessionId, 'dstToSrc')[0]?.msgState).toBe('delivered')
-
             const events: DeliveryEvent[] = []
             pair.source.tunnel.channel!.on('delivery', (e) => events.push(e))
-            pair.relay.dropSocket(pair.relaySessionId, 'source')
             await until(
                 () => (events.some((e) => e.type === 'duplicate' && e.reacked) ? true : undefined),
                 5000,
                 're-ACK',
             )
-            await until(() =>
-                pair.relay.messages(pair.relaySessionId, 'dstToSrc')[0]?.msgState === 'consumed' ? true : undefined,
-            )
-            expect((await pair.srcApi().get('/v1/messages/next')).status).toBe(204)
-            expect(pair.relay.session(pair.relaySessionId)!.epoch).toBe(0)
-
+            await until(() => (pair.destination.tunnel.channel!.delivery.stats().outboxDepth === 0 ? true : undefined))
+            expect((await pair.srcApi().get('/v1/messages/next')).body.messageId).toBe(query.messageId) // unanswered: offered again, once
             await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 1 } })
             const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
-            await pair.dstApi().post(`/v1/messages/${response.messageId}/ack`)
-            await until(() => (pair.relay.messages(pair.relaySessionId, 'dstToSrc').length === 0 ? true : undefined))
+            expect(response.payload).toEqual({ a: 1 })
+            expect(pair.source.tunnel.exchange!.stats().queuedQueries).toBe(0)
         },
     )
 
-    it('survives a destination socket drop mid-round without duplicating anything', { timeout: T }, async () => {
-        pair = await startPair()
-        await pair.connect()
-        const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 'drop' } })).body
-        await until(() => (pair.relay.messages(pair.relaySessionId, 'dstToSrc').length ? true : undefined))
-        pair.relay.dropSocket(pair.relaySessionId, 'destination')
-        await until(() => (pair.relay.isLive(pair.relaySessionId, 'destination') ? true : undefined), 5000, 're-attach')
-        const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
-        await pair.srcApi().post(`/v1/messages/${query.messageId}/ack`)
-        await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 'ok' } })
-        const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
-        expect(response.payload).toEqual({ a: 'ok' })
-        expect(pair.relay.messages(pair.relaySessionId, 'dstToSrc')).toHaveLength(1)
-        await pair.dstApi().post(`/v1/messages/${response.messageId}/ack`)
-    })
+    it(
+        'survives a destination socket drop mid-round: the query is re-offered when the peer is back',
+        { timeout: T },
+        async () => {
+            pair = await startPair()
+            await pair.connect()
+            pair.relay.dropSocket(pair.relaySessionId, 'source') // the query has nobody to go to
+            await until(() => (pair.relay.isLive(pair.relaySessionId, 'source') ? undefined : true))
+            const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 'drop' } })).body
+            await until(() => (pair.relay.isLive(pair.relaySessionId, 'source') ? true : undefined), 5000, 're-attach')
+            const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
+            expect(query.correlationId).toBe(correlationId)
+            await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 'ok' } })
+            const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
+            expect(response.payload).toEqual({ a: 'ok' })
+        },
+    )
 
     it(
         're-encrypts the outbox across an epoch change when the source restarts mid-flight; stale frames are NACKed',
@@ -130,16 +110,25 @@ describe('two tunnels through the fake relay', () => {
             pair = await startPair()
             await pair.connect()
             const oldEpoch = pair.destination.tunnel.channel!.epochTag!
+            // a frame sealed under the soon-to-be superseded epoch, prepared while those keys still exist
+            const oldSession = pair.source.tunnel.channel!.currentSession!
+            const staleId = randomUUID()
+            const staleAad = encodeChunkHeader({
+                messageId: staleId,
+                chunkIndex: 0,
+                chunkCount: 1,
+                senderConnectionId: pair.destination.tunnel.identity.connectionId,
+            })
+            for (let i = 0; i < 16; i++) oldSession.encrypt(Buffer.alloc(1), staleAad) // counter past the new window
+            const stale = oldSession.encrypt(pad(Buffer.from('{}'), PAD_BUCKETS), staleAad)
             pair.source.tunnel.stop()
             await pair.source.close()
             const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 'buffered' } })).body
-            await until(() => (pair.relay.messages(pair.relaySessionId, 'dstToSrc').length === 1 ? true : undefined))
             expect(pair.destination.tunnel.channel!.delivery.stats().outboxDepth).toBe(1)
 
             const events: DeliveryEvent[] = []
             pair.destination.tunnel.channel!.on('delivery', (e) => events.push(e))
             const fresh = await pair.restart('source')
-            expect(pair.relay.session(pair.relaySessionId)!.epoch).toBe(1)
             expect(pair.destination.tunnel.channel!.epochTag).not.toBe(oldEpoch)
             expect(fresh.tunnel.channel!.epochTag).toBe(pair.destination.tunnel.channel!.epochTag)
             expect(pair.destination.tunnel.lifecycle.history.map((t) => t.to)).toEqual(
@@ -149,29 +138,27 @@ describe('two tunnels through the fake relay', () => {
             const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'redelivered query')
             expect(query.correlationId).toBe(correlationId)
             expect(query.payload).toEqual({ q: 'buffered' })
-            expect(events.filter((e) => e.type === 'sent')).toHaveLength(1)
             expect(events.find((e) => e.type === 'sent')).toMatchObject({
-                resend: true,
                 epochTag: pair.destination.tunnel.channel!.epochTag,
             })
 
-            // a frame from the superseded epoch is discarded, not redelivered forever
+            // a frame sealed under the superseded epoch is discarded with a NACK
             const nacked = new Promise<string>((resolve) =>
-                pair.relay.once('nack', (_s, messageId) => resolve(messageId)),
+                pair.relay.on(
+                    'forwarded',
+                    (_s, from, frame) => from === 'source' && frame.type === 'NACK' && resolve(frame.header.messageId),
+                ),
             )
-            const staleId = uuidv4()
             pair.relay.injectFrame(pair.relaySessionId, 'source', {
                 type: 'DATA',
-                header: { messageId: staleId, chunkIndex: 0, chunkCount: 1, epochTag: oldEpoch, sizeBytes: 1024 },
-                payload: Buffer.alloc(1024),
+                header: { messageId: staleId, chunkIndex: 0, chunkCount: 1 },
+                payload: stale,
             })
             expect(await nacked).toBe(staleId)
 
-            await pair.srcApi().post(`/v1/messages/${query.messageId}/ack`)
             await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 'after restart' } })
             const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
             expect(response.payload).toEqual({ a: 'after restart' })
-            await pair.dstApi().post(`/v1/messages/${response.messageId}/ack`)
             expect((await pair.srcApi().get('/v1/messages/next')).status).toBe(204)
         },
     )
@@ -183,69 +170,74 @@ describe('two tunnels through the fake relay', () => {
             pair = await startPair()
             await pair.connect()
             const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 'round' } })).body
-            const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
-            await pair.srcApi().post(`/v1/messages/${query.messageId}/ack`)
+            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
             await pair.srcApi().post('/v1/messages', { inReplyTo: correlationId, payload: { a: 'answer' } })
-            await until(() => (pair.relay.messages(pair.relaySessionId, 'srcToDst').length === 1 ? true : undefined))
-
             // the destination dies before its RC ever polls the response
             await pair.restart('destination')
-            expect(pair.relay.session(pair.relaySessionId)!.epoch).toBe(1)
-
-            // the source's un-ACKed response was purged with the old epoch; the source re-encrypts it
-            // from its outbox under the new keys and re-sends (v2 §7.3), so the new destination holds it
+            // the source's un-ACKed response is re-encrypted from its outbox under the new keys and re-sent
             const stored = await until(
                 () => pair.destination.tunnel.exchange!.responseFor(correlationId),
                 5000,
                 're-sent response',
             )
             expect(stored.payload).toEqual({ a: 'answer' })
-            expect(pair.relay.messages(pair.relaySessionId, 'srcToDst')).toHaveLength(1)
-
             // the SDK re-issues the round under the same correlationId (T1): idempotent, nothing new is sent
             const reissued = await pair.dstApi().post('/v1/request', { payload: { q: 'round' }, correlationId })
-            expect(reissued.status).toBe(202)
             expect(reissued.body).toEqual({ correlationId, reissued: true })
             const response = await poll200(() => pair.dstApi().get(`/v1/responses/${correlationId}`), 'response')
             expect(response.payload).toEqual({ a: 'answer' })
             expect((await pair.srcApi().get('/v1/messages/next')).status).toBe(204)
-            await pair.dstApi().post(`/v1/messages/${response.messageId}/ack`)
-            await until(() =>
-                pair.relay.messages(pair.relaySessionId, 'dstToSrc').length +
-                    pair.relay.messages(pair.relaySessionId, 'srcToDst').length ===
-                0
-                    ? true
-                    : undefined,
-            )
+            await until(() => (pair.source.tunnel.channel!.delivery.stats().outboxDepth === 0 ? true : undefined))
         },
     )
 
     it(
-        'surfaces a full window as a retryable 429 and retries relay-side BACKPRESSURE from the outbox',
+        'surfaces a full local window as a retryable 429 and retries relay-side BACKPRESSURE from the outbox',
         { timeout: T },
         async () => {
-            pair = await startPair({ relayOptions: { limits: { windowBytes: 64 } } })
+            pair = await startPair({ env: { FUSION_INFLIGHT_MAX_MSGS: '1', FUSION_BACKPRESSURE_RETRY_MS: '50' } })
             await pair.connect()
-            const refused = await pair.dstApi().post('/v1/request', { payload: { q: 1 } })
-            expect(refused.status).toBe(429)
-            expect(refused.body.error.code).toBe('BACKPRESSURE')
-            expect(refused.headers.get('retry-after')).toBe('1')
-            expect(pair.destination.tunnel.exchange!.stats().inFlight).toBe(false)
-            await pair.close()
+            pair.relay.dropSocket(pair.relaySessionId, 'source')
+            await until(() => (pair.relay.isLive(pair.relaySessionId, 'source') ? undefined : true))
+            const first = await pair.dstApi().post('/v1/request', { payload: { q: 1 } })
+            expect(first.status).toBe(202)
+            // a second message cannot be queued behind the un-ACKed first one
+            const refused = await pair
+                .dstApi()
+                .post('/v1/request', { payload: { q: 2 }, correlationId: randomUUID() })
+                .then(
+                    (r) => r,
+                    () => undefined,
+                )
+            expect(refused?.status).toBe(409) // single in-flight round wins before the window is even consulted
+            expect(() =>
+                pair.destination.tunnel.channel!.delivery.send({
+                    kind: 'query',
+                    messageId: randomUUID(),
+                    correlationId: randomUUID(),
+                    payload: 2,
+                }),
+            ).toThrow(/window is full/)
+            await until(() => (pair.relay.isLive(pair.relaySessionId, 'source') ? true : undefined), 5000, 're-attach')
+            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query after re-attach')
+            await pair.srcApi().post('/v1/messages', { inReplyTo: first.body.correlationId, payload: { a: 1 } })
+            await poll200(() => pair.dstApi().get(`/v1/responses/${first.body.correlationId}`), 'first response')
 
-            pair = await startPair({ env: { FUSION_BACKPRESSURE_RETRY_MS: '50' } })
-            await pair.connect()
-            const backpressured = new Promise<string>((resolve) =>
-                pair.relay.once('backpressure', (_s, _d, messageId) => resolve(messageId)),
-            )
-            pair.relay.limits.windowBytes = 64 // the relay tightens after admission
-            const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 1 } })).body
-            await backpressured
-            expect((await pair.dstApi().get(`/v1/responses/${correlationId}`)).status).toBe(204)
-            expect(pair.destination.tunnel.channel!.delivery.stats().outboxDepth).toBe(1)
-            pair.relay.limits.windowBytes = 32 * 1024 * 1024
-            const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query after backpressure')
-            expect(query.correlationId).toBe(correlationId)
+            // relay BACKPRESSURE against a message still in the outbox (its end-to-end ACK is lost):
+            // re-offered after the retry delay, not dropped
+            const events: DeliveryEvent[] = []
+            pair.destination.tunnel.channel!.on('delivery', (e) => events.push(e))
+            pair.relay.dropNext('source', 'ACK', 1)
+            await pair.dstApi().post('/v1/request', { payload: { q: 2 } })
+            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'second query')
+            const id = pair.destination.tunnel.channel!.delivery.outbox.inOrder()[0]?.messageId
+            expect(id).toBeDefined()
+            pair.relay.injectFrame(pair.relaySessionId, 'destination', {
+                type: 'ERROR',
+                header: { code: 'BACKPRESSURE', retryable: true, messageId: id! },
+            })
+            await until(() => (events.some((e) => e.type === 'sent' && e.resend) ? true : undefined), 5000, 'resend')
+            expect(events.some((e) => e.type === 'backpressure')).toBe(true)
         },
     )
 
@@ -256,8 +248,10 @@ describe('two tunnels through the fake relay', () => {
             pair = await startPair()
             await pair.connect()
             const session = pair.source.tunnel.channel!.currentSession!
-            const messageId = uuidv4()
-            const plaintext = Buffer.from(JSON.stringify({ v: 1, kind: 'query', correlationId: uuidv4(), payload: 1 }))
+            const messageId = randomUUID()
+            const plaintext = Buffer.from(
+                JSON.stringify({ v: 1, kind: 'query', correlationId: randomUUID(), payload: 1 }),
+            )
             const aad = encodeChunkHeader({
                 messageId,
                 chunkIndex: 0,
@@ -266,18 +260,17 @@ describe('two tunnels through the fake relay', () => {
             })
             const events: DeliveryEvent[] = []
             pair.destination.tunnel.channel!.on('delivery', (e) => events.push(e))
-            const nacked = new Promise<string>((resolve) => pair.relay.once('nack', (_s, id) => resolve(id)))
             expect(
                 pair.source.tunnel.channel!.relay.send({
                     type: 'DATA',
-                    header: { messageId, chunkIndex: 0, chunkCount: 1, epochTag: session.epochTag!, sizeBytes: 1024 },
-                    payload: session.encrypt(pad(plaintext, TUNING_DEFAULTS.padBuckets), aad),
+                    header: { messageId, chunkIndex: 0, chunkCount: 1 },
+                    payload: session.encrypt(pad(plaintext, PAD_BUCKETS), aad),
                 }),
             ).toBe(true)
-            expect(await nacked).toBe(messageId)
+            await until(() => events.find((e) => e.type === 'nack'), 5000, 'nack')
             expect(events.find((e) => e.type === 'nack')).toMatchObject({ messageId, reason: 'direction' })
             expect(pair.destination.tunnel.exchange!.stats()).toMatchObject({
-                pendingAcks: 0,
+                unconsumed: 0,
                 queuedQueries: 0,
                 inFlight: false,
             })
@@ -292,7 +285,6 @@ describe('two tunnels through the fake relay', () => {
             await pair.connect()
             const first = await runRound(pair, { q: 1 }, () => ({ a: 1 }))
             expect(first.response.budget).toMatchObject({ roundsUsed: 1, roundsMax: 1 })
-
             const limit = new Promise<string>((resolve) =>
                 pair.source.tunnel.channel!.once('limitExceeded', (e) => resolve(e.limit)),
             )
@@ -305,40 +297,51 @@ describe('two tunnels through the fake relay', () => {
                 5000,
                 'destination terminal',
             )
-
             const dstPoll = await pair.dstApi().get(`/v1/responses/${second.body.correlationId}`)
             expect(dstPoll.status).toBe(200)
-            expect(dstPoll.body).toEqual({ terminal: true, code: 'LIMIT_EXCEEDED' })
-            const srcPoll = await pair.srcApi().get('/v1/messages/next')
-            expect(srcPoll.body).toEqual({ terminal: true, code: 'LIMIT_EXCEEDED' })
+            expect(dstPoll.body).toMatchObject({
+                terminal: true,
+                code: 'LIMIT_EXCEEDED',
+                detail: { cap: 'maxRounds', limit: 1, observed: 2 },
+            })
+            expect((await pair.srcApi().get('/v1/messages/next')).body).toMatchObject({
+                terminal: true,
+                code: 'LIMIT_EXCEEDED',
+            })
             expect(pair.source.tunnel.exchange!.stats().queuedQueries).toBe(0)
             expect(pair.source.tunnel.caps!.consumed().rounds).toBe(1)
-            expect((await pair.dstApi().post('/v1/request', { payload: 3 })).status).toBe(410)
+            expect((await pair.dstApi().post('/v1/request', { payload: 3 })).body.code).toBe('LIMIT_EXCEEDED')
         },
     )
 
     it(
-        'response-side cap breach refuses the response with a typed terminal error and notifies the destination',
+        'response-side cap breach refuses the response with a typed terminal body and notifies the destination',
         { timeout: T },
         async () => {
             pair = await startPair({ sourceBundle: { caps: { maxResponsePlaintextBytesPerRound: 20 } } })
             await pair.connect()
             const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 1 } })).body
-            const query = await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
-            await pair.srcApi().post(`/v1/messages/${query.messageId}/ack`)
+            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query')
             const refused = await pair
                 .srcApi()
                 .post('/v1/messages', { inReplyTo: correlationId, payload: { big: 'x'.repeat(100) } })
-            expect(refused.status).toBe(410)
-            expect(refused.body).toMatchObject({ terminal: true, code: 'LIMIT_EXCEEDED' })
-            expect(refused.body.message).toContain('maxResponsePlaintextBytesPerRound')
+            expect(refused.status).toBe(200)
+            expect(refused.body).toMatchObject({
+                terminal: true,
+                code: 'LIMIT_EXCEEDED',
+                detail: { cap: 'maxResponsePlaintextBytesPerRound', limit: 20 },
+            })
             await until(
                 () => (pair.destination.tunnel.lifecycle.state === 'LIMIT_EXCEEDED' ? true : undefined),
                 5000,
                 'destination terminal',
             )
             const dstPoll = await pair.dstApi().get(`/v1/responses/${correlationId}`)
-            expect(dstPoll.body).toEqual({ terminal: true, code: 'LIMIT_EXCEEDED' })
+            expect(dstPoll.body).toMatchObject({
+                terminal: true,
+                code: 'LIMIT_EXCEEDED',
+                detail: { cap: 'maxResponsePlaintextBytesPerRound' },
+            })
             expect(pair.destination.tunnel.exchange!.responseFor(correlationId)).toBeUndefined()
         },
     )

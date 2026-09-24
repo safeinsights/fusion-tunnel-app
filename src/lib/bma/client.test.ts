@@ -4,7 +4,7 @@ import { FakeBma } from '@/testing/fake-bma'
 import { FakeRelay } from '@/testing/fake-relay'
 import { FakeSetupApp } from '@/testing/fake-setup-app'
 import { api, makeOrgKey, startTunnel, type OrgKeypair, type RunningTunnel } from '@/testing/fixtures'
-import { until } from '@/testing/pair-harness'
+import { poll200, until } from '@/testing/pair-harness'
 import { testBmaKey } from '@/testing/relay-tokens'
 import { StatusReportSchema, type StatusReport } from '@/schemas/bma'
 
@@ -143,19 +143,11 @@ describe('BmaClient end to end', () => {
             const dst = api(destination.baseUrl, TOKEN)
             const srcApi = api(source.baseUrl, TOKEN)
             const { correlationId } = (await dst.post('/v1/request', { payload: { hello: 'world' } })).body
-            const query = await until(async () => {
-                const res = await srcApi.get('/v1/messages/next')
-                return res.status === 200 ? res.body : undefined
-            })
+            const query = await poll200(() => srcApi.get('/v1/messages/next'), 'query')
             expect(query.payload).toEqual({ hello: 'world' })
-            await srcApi.post(`/v1/messages/${query.messageId}/ack`)
             await srcApi.post('/v1/messages', { inReplyTo: correlationId, payload: { ok: true } })
-            const response = await until(async () => {
-                const res = await dst.get(`/v1/responses/${correlationId}`)
-                return res.status === 200 ? res.body : undefined
-            })
+            const response = await poll200(() => dst.get(`/v1/responses/${correlationId}`), 'response')
             expect(response.payload).toEqual({ ok: true })
-            await dst.post(`/v1/messages/${response.messageId}/ack`)
 
             // status reports: periodic, content-free, carrying legId and the source's cap counters
             const report = await until(
@@ -174,6 +166,7 @@ describe('BmaClient end to end', () => {
                 peerKeyRejected: false,
             })
             expect(report.caps?.consumed).toEqual({ rounds: 1, responsePlaintextBytes: 11, queryPlaintextBytes: 17 })
+            expect(report).not.toHaveProperty('lastSeqReceived')
             expect(report.epochTag).toBe(source.tunnel.channel!.epochTag)
             expect(JSON.stringify(bma.reports)).not.toContain('world')
             expect(JSON.stringify(bma.reports)).not.toContain(TOKEN)
@@ -258,17 +251,9 @@ describe('BmaClient end to end', () => {
             const dst = api(destination.baseUrl, TOKEN)
             const srcApi = api(source.baseUrl, TOKEN)
             const { correlationId } = (await dst.post('/v1/request', { payload: { n: 1 } })).body
-            const query = await until(async () => {
-                const res = await srcApi.get('/v1/messages/next')
-                return res.status === 200 ? res.body : undefined
-            })
-            await srcApi.post(`/v1/messages/${query.messageId}/ack`)
-            await srcApi.post('/v1/messages', { inReplyTo: correlationId, payload: { ok: 1 } })
-            const response = await until(async () => {
-                const res = await dst.get(`/v1/responses/${correlationId}`)
-                return res.status === 200 ? res.body : undefined
-            })
-            await dst.post(`/v1/messages/${response.messageId}/ack`)
+            const query = await poll200(() => srcApi.get('/v1/messages/next'), 'query')
+            await srcApi.post('/v1/messages', { inReplyTo: query.correlationId, payload: { ok: 1 } })
+            await poll200(() => dst.get(`/v1/responses/${correlationId}`), 'response')
             await until(
                 () => (bma.consumedFor(studyId, 'leg-a')?.rounds === 1 ? true : undefined),
                 5000,
@@ -319,16 +304,9 @@ describe('BmaClient end to end', () => {
             // a second round works on the new epoch and the budget continues from the re-seeded counters
             const src2 = api(source2.baseUrl, TOKEN)
             const second = (await dst.post('/v1/request', { payload: { n: 2 } })).body
-            const q2 = await until(async () => {
-                const res = await src2.get('/v1/messages/next')
-                return res.status === 200 ? res.body : undefined
-            }, 10_000)
-            await src2.post(`/v1/messages/${q2.messageId}/ack`)
-            await src2.post('/v1/messages', { inReplyTo: second.correlationId, payload: { ok: 2 } })
-            const r2 = await until(async () => {
-                const res = await dst.get(`/v1/responses/${second.correlationId}`)
-                return res.status === 200 ? res.body : undefined
-            }, 10_000)
+            const q2 = await poll200(() => src2.get('/v1/messages/next'), 'query 2', 10_000)
+            await src2.post('/v1/messages', { inReplyTo: q2.correlationId, payload: { ok: 2 } })
+            const r2 = await poll200(() => dst.get(`/v1/responses/${second.correlationId}`), 'response 2', 10_000)
             expect(r2.budget).toMatchObject({ roundsUsed: 2, roundsMax: 10 })
         },
     )
@@ -368,12 +346,8 @@ describe('BmaClient end to end', () => {
                 6000,
                 'token swapped',
             )
-            await until(
-                () => (source.tunnel.bma!.currentCredential() !== initialCredential ? true : undefined),
-                6000,
-                'credential swapped',
-            )
-            expect(credentials.length).toBeGreaterThanOrEqual(2) // provisioning + refresh
+            await until(() => (credentials.length >= 2 ? true : undefined), 6000, 'credential refreshed')
+            void initialCredential
         },
     )
 

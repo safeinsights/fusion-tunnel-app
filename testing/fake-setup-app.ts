@@ -132,16 +132,6 @@ export class FakeSetupApp {
         return { bundle, generation, configureStatus: configured.status }
     }
 
-    async reportLaunch(studyId: string, legId: string, role: Role): Promise<number> {
-        const res = await this.bma('POST', '/tunnel/runs/launched', { studyId, legId, role })
-        return res.status
-    }
-
-    async visibleRuns(): Promise<unknown> {
-        const res = await this.bma('GET', '/tunnel/runs')
-        return res.json()
-    }
-
     private bma(method: string, path: string, body?: unknown): Promise<Response> {
         return this.fetchImpl(`${this.bmaUrl}${path}`, {
             method,

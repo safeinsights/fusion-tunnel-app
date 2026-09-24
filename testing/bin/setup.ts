@@ -3,9 +3,9 @@ import { makeOrgKey } from '@/testing/fixtures'
 import { env, envJson, waitForHttp } from './env'
 
 // Compose entrypoint standing in for every enclave's Setup App at once: generates an org key per
-// org, registers it with the fake BMA, provisions each tunnel over its enclave-local API, and
-// reports launches so the run group pairs. In production each enclave runs its own Setup App and
-// holds its own org key; one container plays them all here because compose is one host.
+// org, registers it with the fake BMA and provisions each tunnel over its enclave-local API. In
+// production each enclave runs its own Setup App and holds its own org key; one container plays
+// them all here because compose is one host.
 
 type Leg = {
     legId: string

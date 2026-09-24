@@ -27,16 +27,19 @@ const TRANSITIONS: Readonly<Record<TunnelState, readonly TunnelState[]>> = {
     PEER_KEY_VERIFIED: ['RELAY_ATTACHED', 'ERRORED', 'LIMIT_EXCEEDED'],
     RELAY_ATTACHED: ['CHANNEL_UP', 'ERRORED', 'LIMIT_EXCEEDED'],
     CHANNEL_UP: ['RELAY_ATTACHED', 'CLOSING', 'ERRORED', 'LIMIT_EXCEEDED'],
-    // CLOSING -> LIMIT_EXCEEDED: the source sends its LIMIT_EXCEEDED control through the mailbox and
-    // its CLOSE as a frame; the relay may forward the CLOSE first (store latency), so the cap notice
-    // can land while we are already CLOSING and must still end the leg as LIMIT_EXCEEDED, not CLOSED.
+    // CLOSING -> LIMIT_EXCEEDED: a destination that completes at the same instant the source breaches a
+    // cap receives the source's authenticated LIMIT_EXCEEDED close while already CLOSING; the leg must
+    // still end as LIMIT_EXCEEDED, never be recorded as a clean completion.
     CLOSING: ['CLOSED', 'ERRORED', 'LIMIT_EXCEEDED'],
     CLOSED: [],
     ERRORED: [],
     LIMIT_EXCEEDED: [],
 }
 
-export type Transition = { from: TunnelState; to: TunnelState; reason: string; at: Date }
+export type Transition = { from: TunnelState; to: TunnelState; reason: string; at: Date; detail?: TerminalDetail }
+
+/** Content-free detail carried by a LIMIT_EXCEEDED end: which cap, its limit and what was observed. */
+export type TerminalDetail = { cap: string; limit: number; observed: number }
 
 export class IllegalTransitionError extends Error {
     constructor(
@@ -84,9 +87,9 @@ export class Lifecycle {
         return TRANSITIONS[this.current].includes(to)
     }
 
-    transition(to: TunnelState, reason: string): Transition {
+    transition(to: TunnelState, reason: string, detail?: TerminalDetail): Transition {
         if (!this.canTransition(to)) throw new IllegalTransitionError(this.current, to)
-        const transition: Transition = { from: this.current, to, reason, at: this.now() }
+        const transition: Transition = { from: this.current, to, reason, at: this.now(), ...(detail ? { detail } : {}) }
         this.current = to
         this.transitions.push(transition)
         this.emitter.emit('transition', transition)
@@ -94,10 +97,15 @@ export class Lifecycle {
     }
 
     /** Enter a terminal failure state from any non-terminal state; a no-op once terminal. */
-    fail(to: 'ERRORED' | 'LIMIT_EXCEEDED', reason: string): Transition | undefined {
+    fail(to: 'ERRORED' | 'LIMIT_EXCEEDED', reason: string, detail?: TerminalDetail): Transition | undefined {
         if (this.isTerminal()) return undefined
         if (!this.canTransition(to)) return undefined
-        return this.transition(to, reason)
+        return this.transition(to, reason, detail)
+    }
+
+    /** The detail of the transition that ended the leg, if it carried one. */
+    terminalDetail(): TerminalDetail | undefined {
+        return this.transitions.at(-1)?.detail
     }
 
     /** The typed code the local API surfaces once the session is ending or ended. */
