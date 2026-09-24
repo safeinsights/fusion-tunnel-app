@@ -11,7 +11,7 @@ import {
 } from '@/schemas/provisioning'
 import { PublishKeyResponseSchema, RelaySessionResponseSchema, signKeyBlob } from '@/schemas/bma'
 import { ORG_JWT_AUDIENCE } from '@/testing/fake-bma'
-import type { OrgKeypair } from '@/testing/fixtures'
+import { PROVISION_TOKEN, type OrgKeypair } from '@/testing/fixtures'
 
 // The harness's Setup App: holder of the org private key, it performs every org-authenticated
 // provisioning step on a tunnel's behalf (v2 §4.4, sequence phase 2): read the fresh public keys,
@@ -27,6 +27,8 @@ export type ProvisionRequest = {
     /** Pinned from the approved study configuration — never fetched from the BMA. */
     peerOrgPublicKeyPem: string
     localApiToken: string
+    /** The tunnel's FUSION_PROVISION_TOKEN (the Setup App injected it into the tunnel's environment). */
+    provisionToken?: string
     caps?: Caps
     guards?: Guards
     operations?: Operation[]
@@ -52,8 +54,9 @@ export class FakeSetupApp {
     }
 
     async provision(tunnelUrl: string, request: ProvisionRequest): Promise<ProvisionResult> {
+        const provisionAuth = { authorization: `Bearer ${request.provisionToken ?? PROVISION_TOKEN}` }
         // 1. the tunnel's freshly generated public keys
-        const identityRes = await this.fetchImpl(`${tunnelUrl}/local/identity`)
+        const identityRes = await this.fetchImpl(`${tunnelUrl}/local/identity`, { headers: provisionAuth })
         if (identityRes.status !== 200) throw new Error(`identity: ${identityRes.status}`)
         const identity = IdentityResponseSchema.parse(await identityRes.json())
         const publicKey = Buffer.from(identity.publicKey, 'base64url')
@@ -123,7 +126,7 @@ export class FakeSetupApp {
         }
         const configured = await this.fetchImpl(`${tunnelUrl}/local/configure`, {
             method: 'POST',
-            headers: { 'content-type': 'application/json' },
+            headers: { ...provisionAuth, 'content-type': 'application/json' },
             body: JSON.stringify(bundle),
         })
         return { bundle, generation, configureStatus: configured.status }

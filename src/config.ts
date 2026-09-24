@@ -190,15 +190,38 @@ export const loadTuning = (env: Env = process.env): Tuning => {
 
 export type ServerConfig = {
     port: number
+    /**
+     * Bearer token the Setup App presents on the provisioning API (/local/*). Injected into the
+     * tunnel container's environment by the Setup App and never into the research container's, so
+     * a co-located workload that can reach the port cannot provision (or race the Setup App to
+     * provision) the tunnel. Undefined only when the variable is unset; `main()` refuses to boot then.
+     */
+    provisionToken: string | undefined
     tuning: Tuning
 }
 
 export const DEFAULT_PORT = 3003
+export const PROVISION_TOKEN_ENV = 'FUSION_PROVISION_TOKEN'
+export const PROVISION_TOKEN_MIN_LENGTH = 16
+export const PROVISION_TOKEN_MAX_LENGTH = 512
+
+const envProvisionToken = (env: Env): string | undefined => {
+    const raw = env[PROVISION_TOKEN_ENV]
+    if (raw === undefined || raw === '') return undefined
+    if (raw.length < PROVISION_TOKEN_MIN_LENGTH || raw.length > PROVISION_TOKEN_MAX_LENGTH) {
+        throw new ConfigError(
+            `${PROVISION_TOKEN_ENV} must be ${PROVISION_TOKEN_MIN_LENGTH}-${PROVISION_TOKEN_MAX_LENGTH} characters`,
+        )
+    }
+    if (/\s/.test(raw)) throw new ConfigError(`${PROVISION_TOKEN_ENV} must not contain whitespace`)
+    return raw
+}
+
 export const loadConfig = (env: Env = process.env): ServerConfig => {
     const rawPort = env.PORT
     // PORT=0 is allowed so tests can bind an ephemeral port.
     const port =
         rawPort === undefined || rawPort === '' ? DEFAULT_PORT : rawPort === '0' ? 0 : parsePositiveInt('PORT', rawPort)
     if (port > 65535) throw new ConfigError(`PORT must be <= 65535, got "${rawPort}"`)
-    return { port, tuning: loadTuning(env) }
+    return { port, provisionToken: envProvisionToken(env), tuning: loadTuning(env) }
 }

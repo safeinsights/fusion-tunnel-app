@@ -161,6 +161,45 @@ describe('close and failure flows', () => {
     )
 
     it(
+        'a relay ending the session without an authenticated CLOSE errors both sides: exit 1, never STUDY_COMPLETE',
+        { timeout: T },
+        async () => {
+            pair = await startPair()
+            await pair.connect()
+            await runRound(pair, { q: 1 }, () => ({ a: 1 }))
+            const bothExited = armExits(pair, 1500)
+            const { correlationId } = (await pair.dstApi().post('/v1/request', { payload: { q: 2 } })).body
+            await poll200(() => pair.srcApi().get('/v1/messages/next'), 'query delivered')
+            // The relay purges the session outright: SESSION_CLOSED on both sockets, no CLOSE exchanged.
+            expect(pair.relay.forceClose(pair.relaySessionId)).toBe(true)
+            await until(
+                () =>
+                    pair.source.tunnel.lifecycle.state === 'ERRORED' &&
+                    pair.destination.tunnel.lifecycle.state === 'ERRORED'
+                        ? true
+                        : undefined,
+                5000,
+                'both errored',
+            )
+            for (const side of [pair.source, pair.destination]) {
+                const last = side.tunnel.lifecycle.history.at(-1)!
+                expect(last.from).toBe('CHANNEL_UP')
+                expect(last.reason).toMatch(/without an authenticated CLOSE/)
+                expect(side.tunnel.lifecycle.history.map((t) => t.to)).not.toContain('CLOSING')
+            }
+            expect((await pair.dstApi().get(`/v1/responses/${correlationId}`)).body).toEqual({
+                terminal: true,
+                code: 'SESSION_ERRORED',
+            })
+            expect((await pair.srcApi().get('/v1/messages/next')).body).toEqual({
+                terminal: true,
+                code: 'SESSION_ERRORED',
+            })
+            expect(await bothExited()).toEqual([1, 1])
+        },
+    )
+
+    it(
         'a cap breach closes the relay session too: both exit 2, nothing lingers in the relay',
         { timeout: T },
         async () => {

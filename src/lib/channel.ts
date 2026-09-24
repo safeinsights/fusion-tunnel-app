@@ -300,12 +300,14 @@ export class Channel extends EventEmitter<ChannelEvents> {
         const lifecycle = this.deps.lifecycle
         if (lifecycle.isTerminal()) return
         if (lifecycle.state !== 'CLOSING') {
-            // The relay ended the session before any CLOSE reached us: a study ending we cannot
-            // authenticate. Ending early is the only thing a relay can force, so log it loudly.
-            log.warn('channel.closed_without_close', { state: lifecycle.state, reason })
-            if (!lifecycle.canTransition('CLOSING'))
-                return void lifecycle.fail('ERRORED', `session closed by relay: ${reason}`)
-            lifecycle.transition('CLOSING', `relay closed the session: ${reason}`)
+            // The relay ended the session before any authenticated CLOSE reached us. Only the
+            // peer's authenticated CLOSE completes a study (v2 §7.6); the relay can end a session
+            // early, but it must not be able to make that look like completion (STUDY_COMPLETE,
+            // exit 0), so this is a session error — reported and exited as such.
+            log.error('channel.closed_without_close', { state: lifecycle.state, reason })
+            lifecycle.fail('ERRORED', `relay closed the session without an authenticated CLOSE: ${reason}`)
+            this.relay.stop()
+            return
         }
         lifecycle.transition('CLOSED', reason)
         log.info('channel.closed', { reason })

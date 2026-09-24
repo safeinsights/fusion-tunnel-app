@@ -19,6 +19,20 @@ export type Guarded = { ok: true; bundle: ConfigurationBundle; exchange: Exchang
 const fail = (response: Response): Guarded => ({ ok: false, response })
 
 /**
+ * The front door for the provisioning API (/local/*): the Setup App's bootstrap bearer, checked
+ * constant-time like the RC token. Network reachability alone grants nothing here either (v2 §4.1):
+ * the research container shares the tunnel's network namespace and must not be able to provision
+ * it. A tunnel without a token configured (tests only; `main()` refuses to boot) answers 401 to all.
+ */
+export const guardProvisioning = (tunnel: Tunnel, req: Request): Response | undefined => {
+    const expected = tunnel.config.provisionToken
+    if (expected === undefined || !isAuthorized(req, expected)) {
+        return apiError(401, 'UNAUTHORIZED', 'missing or invalid provisioning token')
+    }
+    return undefined
+}
+
+/**
  * The common front door for every /v1/* route: configured → authenticated → permitted for the
  * role → session not ended → state ready. Order matters: an unauthenticated caller learns
  * nothing beyond "not configured yet", and role is checked before state so a source RC probing

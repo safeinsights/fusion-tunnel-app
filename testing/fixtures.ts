@@ -17,6 +17,8 @@ let sharedOrgKey: OrgKeypair | undefined
 export const testOrgKey = (): OrgKeypair => (sharedOrgKey ??= makeOrgKey())
 
 export const LOCAL_API_TOKEN = 'test-local-api-token-0123456789abcdef'
+/** The Setup App's bootstrap bearer for /local/*; startTunnel() boots every harness tunnel with it. */
+export const PROVISION_TOKEN = 'test-provision-token-0123456789abcdef'
 
 export const makeBundle = (overrides: Partial<ConfigurationBundle> = {}): ConfigurationBundle => ({
     studyId: 'study-1',
@@ -57,7 +59,12 @@ export type RunningTunnel = { tunnel: Tunnel; baseUrl: string; close: () => Prom
 export const startTunnel = async (
     options: { env?: Record<string, string>; deps?: TunnelDeps } = {},
 ): Promise<RunningTunnel> => {
-    const config = loadConfig({ PORT: '0', FUSION_LONGPOLL_MS: '150', ...options.env })
+    const config = loadConfig({
+        PORT: '0',
+        FUSION_LONGPOLL_MS: '150',
+        FUSION_PROVISION_TOKEN: PROVISION_TOKEN,
+        ...options.env,
+    })
     // Harness tunnels play the directory themselves unless a test wires a BMA explicitly.
     const tunnel = createTunnel(config, { bma: null, ...options.deps })
     const port = await listen(tunnel.server, 0)

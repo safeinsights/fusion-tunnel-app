@@ -7,6 +7,7 @@ import {
     CHUNK_CIPHERTEXT_MAX_BYTES,
     ConfigError,
     DEFAULT_PORT,
+    PROVISION_TOKEN_ENV,
 } from './config'
 
 describe('loadTuning', () => {
@@ -71,5 +72,17 @@ describe('loadConfig', () => {
 
     it('includes the tuning table', () => {
         expect(loadConfig({}).tuning).toEqual(TUNING_DEFAULTS)
+    })
+
+    it('reads the provisioning token, treating unset and empty as absent', () => {
+        expect(loadConfig({}).provisionToken).toBeUndefined()
+        expect(loadConfig({ [PROVISION_TOKEN_ENV]: '' }).provisionToken).toBeUndefined()
+        expect(loadConfig({ [PROVISION_TOKEN_ENV]: 'a-provisioning-token-0123456789' }).provisionToken).toBe(
+            'a-provisioning-token-0123456789',
+        )
+    })
+
+    it.each(['short', 'x'.repeat(513), 'has whitespace in it 0123'])('rejects the provisioning token %s', (raw) => {
+        expect(() => loadConfig({ [PROVISION_TOKEN_ENV]: raw })).toThrow(ConfigError)
     })
 })

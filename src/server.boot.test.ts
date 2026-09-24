@@ -19,6 +19,7 @@ describe('server startup', () => {
     it('boots and listens outside of test', async () => {
         vi.stubEnv('NODE_ENV', 'production')
         vi.stubEnv('PORT', '0')
+        vi.stubEnv('FUSION_PROVISION_TOKEN', 'boot-test-provision-token-0123456789')
         const mod = await import('@/server')
         expect(mod.tunnel).toBeDefined()
         await new Promise<void>((resolve) => {
@@ -30,9 +31,19 @@ describe('server startup', () => {
         await new Promise<void>((resolve) => mod.tunnel!.server.close(() => resolve()))
     })
 
+    it('refuses to boot without a provisioning token', async () => {
+        vi.stubEnv('NODE_ENV', 'production')
+        vi.stubEnv('PORT', '0')
+        vi.stubEnv('FUSION_PROVISION_TOKEN', '')
+        const booted = await import('@/server').catch((error: Error) => error)
+        expect(booted).toBeInstanceOf(Error)
+        expect((booted as Error).message).toContain('FUSION_PROVISION_TOKEN')
+    })
+
     it('refuses to boot on an invalid tuning value', async () => {
         vi.stubEnv('NODE_ENV', 'production')
         vi.stubEnv('PORT', '0')
+        vi.stubEnv('FUSION_PROVISION_TOKEN', 'boot-test-provision-token-0123456789')
         vi.stubEnv('FUSION_LONGPOLL_MS', 'soon')
         const booted = await import('@/server').catch((error: Error) => error)
         expect(booted).toBeInstanceOf(Error)

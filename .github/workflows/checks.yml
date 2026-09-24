@@ -53,7 +53,8 @@ jobs:
             # come up and answer /health with a read-only root filesystem and no writable mounts.
             - name: Read-only root filesystem smoke test
               run: |
-                  cid=$(docker run -d --read-only -p 3003:3003 fusion-tunnel-app:ci)
+                  cid=$(docker run -d --read-only -p 3003:3003 \
+                      -e FUSION_PROVISION_TOKEN=ci-smoke-provision-token-0123456789 fusion-tunnel-app:ci)
                   ok=0
                   for _ in $(seq 1 30); do
                       if curl -fsS http://localhost:3003/health; then ok=1; break; fi

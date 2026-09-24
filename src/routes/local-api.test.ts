@@ -5,6 +5,7 @@ import {
     driveToChannelUp,
     LOCAL_API_TOKEN,
     makeBundle,
+    PROVISION_TOKEN,
     RecordingTransport,
     startTunnel,
     tick,
@@ -21,15 +22,41 @@ describe('provisioning API', () => {
     })
     afterAll(() => running.close())
 
+    it('GET /local/identity and POST /local/configure require the provisioning bearer', async () => {
+        for (const token of [undefined, 'wrong-provision-token-0123456789', LOCAL_API_TOKEN]) {
+            const client = api(running.baseUrl, token)
+            const identity = await client.get('/local/identity')
+            expect(identity.status, `identity with ${token}`).toBe(401)
+            expect(identity.body).toEqual({ error: { code: 'UNAUTHORIZED', message: expect.any(String) } })
+            expect(JSON.stringify(identity.body)).not.toContain(running.tunnel.identity.connectionId)
+            const configure = await client.post('/local/configure', makeBundle())
+            expect(configure.status, `configure with ${token}`).toBe(401)
+        }
+        expect(running.tunnel.lifecycle.state).toBe('AWAITING_CONFIG')
+        expect(running.tunnel.bundle).toBeUndefined()
+    })
+
+    it('a tunnel started without a provisioning token answers 401 to every /local call', async () => {
+        const bare = await startTunnel({ env: { FUSION_PROVISION_TOKEN: '' } })
+        try {
+            expect(bare.tunnel.config.provisionToken).toBeUndefined()
+            expect((await api(bare.baseUrl, PROVISION_TOKEN).get('/local/identity')).status).toBe(401)
+            expect((await api(bare.baseUrl, PROVISION_TOKEN).post('/local/configure', makeBundle())).status).toBe(401)
+            expect(bare.tunnel.lifecycle.state).toBe('AWAITING_CONFIG')
+        } finally {
+            await bare.close()
+        }
+    })
+
     it('GET /local/identity returns the fresh public keys', async () => {
-        const res = await api(running.baseUrl).get('/local/identity')
+        const res = await api(running.baseUrl, PROVISION_TOKEN).get('/local/identity')
         expect(res.status).toBe(200)
         expect(IdentityResponseSchema.safeParse(res.body).success).toBe(true)
         expect(res.body.connectionId).toBe(running.tunnel.identity.connectionId)
     })
 
     it('POST /local/configure rejects malformed JSON, schema failures and an unparseable org key', async () => {
-        const client = api(running.baseUrl)
+        const client = api(running.baseUrl, PROVISION_TOKEN)
         expect((await client.postRaw('/local/configure', '{oops')).status).toBe(400)
 
         const invalid = await client.post('/local/configure', { ...makeBundle(), role: 'observer', localApiToken: 'x' })
@@ -50,7 +77,7 @@ describe('provisioning API', () => {
     })
 
     it('POST /local/configure accepts a bundle once, idempotently, and conflicts on a different one', async () => {
-        const client = api(running.baseUrl)
+        const client = api(running.baseUrl, PROVISION_TOKEN)
         const bundle = makeBundle()
         const first = await client.post('/local/configure', bundle)
         expect(first.status).toBe(200)
@@ -67,7 +94,7 @@ describe('provisioning API', () => {
 
     it('POST /local/configure answers 410 once the tunnel is terminal', async () => {
         running.tunnel.lifecycle.fail('ERRORED', 'test')
-        const res = await api(running.baseUrl).post('/local/configure', makeBundle())
+        const res = await api(running.baseUrl, PROVISION_TOKEN).post('/local/configure', makeBundle())
         expect(res.status).toBe(410)
         expect(res.body).toEqual({ terminal: true, code: 'SESSION_ERRORED' })
     })
@@ -100,7 +127,7 @@ describe('local API gating', () => {
     })
 
     it('requires the bearer token once configured', async () => {
-        await api(running.baseUrl).post('/local/configure', makeBundle())
+        await api(running.baseUrl, PROVISION_TOKEN).post('/local/configure', makeBundle())
         expect((await api(running.baseUrl).get('/v1/info')).status).toBe(401)
         expect((await api(running.baseUrl, 'wrong-token-0123456789').get('/v1/info')).status).toBe(401)
         expect((await api(running.baseUrl, LOCAL_API_TOKEN).get('/v1/info')).status).toBe(200)

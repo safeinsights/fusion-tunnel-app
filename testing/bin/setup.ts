@@ -15,6 +15,9 @@ type Leg = {
     destinationTunnelUrl: string
     sourceToken: string
     destinationToken: string
+    /** Each tunnel container's own FUSION_PROVISION_TOKEN. */
+    sourceProvisionToken: string
+    destinationProvisionToken: string
     caps?: Record<string, number>
 }
 
@@ -50,6 +53,7 @@ const main = async () => {
             peerOrgSlug: leg.destinationOrg,
             peerOrgPublicKeyPem: keys.get(leg.destinationOrg)!.pem,
             localApiToken: leg.sourceToken,
+            provisionToken: leg.sourceProvisionToken,
             caps: leg.caps,
         })
         const destination = await apps.get(leg.destinationOrg)!.provision(leg.destinationTunnelUrl, {
@@ -60,6 +64,7 @@ const main = async () => {
             peerOrgSlug: leg.sourceOrg,
             peerOrgPublicKeyPem: keys.get(leg.sourceOrg)!.pem,
             localApiToken: leg.destinationToken,
+            provisionToken: leg.destinationProvisionToken,
         })
         console.log(
             JSON.stringify({

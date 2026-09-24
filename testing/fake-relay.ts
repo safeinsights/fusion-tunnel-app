@@ -114,7 +114,7 @@ export interface FakeRelayEvents {
     nack: [relaySessionId: string, messageId: string]
     backpressure: [relaySessionId: string, direction: Direction, messageId: string]
     deadLetter: [relaySessionId: string, messageId: string]
-    close: [relaySessionId: string, phase: 'requested' | 'acked' | 'purged' | 'timeout']
+    close: [relaySessionId: string, phase: 'requested' | 'acked' | 'purged' | 'timeout' | 'forced']
     handshakeDropped: [relaySessionId: string, toRole: RelayRole]
     blobPut: [relaySessionId: string, blobId: string, bytes: number]
     blobGet: [relaySessionId: string, blobId: string, found: boolean]
@@ -226,6 +226,18 @@ export class FakeRelay extends EventEmitter<FakeRelayEvents> {
         const conn = this.sessions.get(relaySessionId)?.sockets[role]
         if (!conn || conn.ws.readyState !== WebSocket.OPEN) return false
         this.sendFrame(conn.ws, frame)
+        return true
+    }
+
+    /** End a session with SESSION_CLOSED without any CLOSE having been exchanged (a relay-forced end). */
+    forceClose(relaySessionId: string): boolean {
+        const session = this.sessions.get(relaySessionId)
+        if (!session) return false
+        if (session.closeTimer) clearTimeout(session.closeTimer)
+        session.closeTimer = undefined
+        session.status = 'closed'
+        this.endSession(session, { code: 'SESSION_CLOSED', retryable: false })
+        this.emit('close', relaySessionId, 'forced')
         return true
     }
 

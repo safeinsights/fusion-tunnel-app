@@ -13,17 +13,20 @@
 # per enclave joining exactly that enclave's tunnel(s) and research container. Tunnels sit on their
 # enclave network and on `core` (their only egress: relay + BMA).
 
+# Each tunnel gets its own FUSION_PROVISION_TOKEN (the Setup App's bootstrap bearer for /local/*),
+# injected into the tunnel container only — never into a research container's environment.
+x-tunnel-env: &tunnel-env
+    PORT: 3003
+    FUSION_LONGPOLL_MS: 5000
+    FUSION_PEERKEY_POLL_MS: 1000
+    FUSION_HANDSHAKE_RETRY_MS: 1000
+    FUSION_STATUS_INTERVAL_MS: 15000
+
 x-tunnel: &tunnel
     build:
         context: .
         target: runtime
     read_only: true
-    environment:
-        PORT: 3003
-        FUSION_LONGPOLL_MS: 5000
-        FUSION_PEERKEY_POLL_MS: 1000
-        FUSION_HANDSHAKE_RETRY_MS: 1000
-        FUSION_STATUS_INTERVAL_MS: 15000
     healthcheck:
         test: ['CMD', 'curl', '-f', 'http://localhost:3003/health']
         interval: 5s
@@ -71,6 +74,9 @@ services:
     tunnel-src-a:
         <<: *tunnel
         profiles: [two-party, hub]
+        environment:
+            <<: *tunnel-env
+            FUSION_PROVISION_TOKEN: compose-provision-src-a-0123456789
         networks: [core, enclave-a]
 
     rc-src-a:
@@ -91,6 +97,9 @@ services:
     tunnel-src-b:
         <<: *tunnel
         profiles: [hub]
+        environment:
+            <<: *tunnel-env
+            FUSION_PROVISION_TOKEN: compose-provision-src-b-0123456789
         networks: [core, enclave-b]
 
     rc-src-b:
@@ -111,11 +120,17 @@ services:
     tunnel-dst-a:
         <<: *tunnel
         profiles: [two-party, hub]
+        environment:
+            <<: *tunnel-env
+            FUSION_PROVISION_TOKEN: compose-provision-dst-a-0123456789
         networks: [core, enclave-dst]
 
     tunnel-dst-b:
         <<: *tunnel
         profiles: [hub]
+        environment:
+            <<: *tunnel-env
+            FUSION_PROVISION_TOKEN: compose-provision-dst-b-0123456789
         networks: [core, enclave-dst]
 
     rc-dst:
@@ -165,6 +180,8 @@ services:
                 [{"legId":"leg-a","sourceOrg":"dp-a","destinationOrg":"si-hub",
                   "sourceTunnelUrl":"http://tunnel-src-a:3003","destinationTunnelUrl":"http://tunnel-dst-a:3003",
                   "sourceToken":"compose-token-src-a-0123456789","destinationToken":"compose-token-dst-a-0123456789",
+                  "sourceProvisionToken":"compose-provision-src-a-0123456789",
+                  "destinationProvisionToken":"compose-provision-dst-a-0123456789",
                   "caps":{"maxRounds":100}}
                  ${HUB_LEG_B:-}]
         depends_on:
