@@ -180,6 +180,28 @@ describe('close and failure flows', () => {
     )
 
     it(
+        'a cap breach sends CLOSE only after the peer ACKed the LIMIT_EXCEEDED notice (mailbox before frame)',
+        { timeout: T },
+        async () => {
+            pair = await startPair({ sourceBundle: { caps: { maxRounds: 1 } } })
+            await pair.connect()
+            await runRound(pair, { q: 1 }, () => ({ a: 1 }))
+            // The notice is a srcToDst mailbox message; the CLOSE is a frame the relay forwards at once. A
+            // real relay with a slow store can deliver the CLOSE first, so the source must wait for the
+            // notice's ACK before it closes — observed here as the relay seeing that ACK before the CLOSE.
+            const noticeIds = new Set<string>()
+            const order: string[] = []
+            pair.relay.on('data', (_s, direction, messageId) => direction === 'srcToDst' && noticeIds.add(messageId))
+            pair.relay.on('ack', (_s, messageId) => noticeIds.has(messageId) && order.push('notice-acked'))
+            pair.relay.on('close', (_s, phase) => phase === 'requested' && order.push('close-requested'))
+            const bothExited = armExits(pair)
+            await pair.dstApi().post('/v1/request', { payload: { q: 2 } })
+            expect(await bothExited()).toEqual([2, 2])
+            expect(order.slice(0, 2)).toEqual(['notice-acked', 'close-requested'])
+        },
+    )
+
+    it(
         'a source RC that dies after acking gets the re-issued query again and the round completes',
         { timeout: T },
         async () => {

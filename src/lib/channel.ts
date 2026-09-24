@@ -67,6 +67,9 @@ export class Channel extends EventEmitter<ChannelEvents> {
     private closeTimer: NodeJS.Timeout | null = null
     private closing = false
     private stopped = false
+    /** The LIMIT_EXCEEDED notice we queued for the peer; CLOSE waits for its ACK (bounded). */
+    private limitNoticeId: string | undefined
+    private limitNoticeTimer: NodeJS.Timeout | null = null
 
     constructor(private readonly deps: ChannelDeps) {
         super()
@@ -145,8 +148,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
         })
         // A failed session tells the relay to purge (best effort); the relay's own fatal codes need no reply.
         this.deps.lifecycle.onTransition((transition) => {
-            if (transition.to === 'ERRORED' || transition.to === 'LIMIT_EXCEEDED')
-                this.sendCloseBestEffort(transition.reason)
+            if (transition.to === 'ERRORED') this.sendCloseBestEffort(transition.reason)
+            else if (transition.to === 'LIMIT_EXCEEDED') this.sendCloseAfterLimitNotice(transition.reason)
         })
     }
 
@@ -201,6 +204,8 @@ export class Channel extends EventEmitter<ChannelEvents> {
 
     stop(): void {
         this.stopped = true
+        if (this.limitNoticeTimer) clearTimeout(this.limitNoticeTimer)
+        this.limitNoticeTimer = null
         this.clearHandshakeTimer()
         this.clearCloseTimer()
         this.delivery.stop()
@@ -222,6 +227,35 @@ export class Channel extends EventEmitter<ChannelEvents> {
         const sent = this.relay.send({ type: 'CLOSE', header: {}, payload })
         log.info('channel.close_sent', { sent, authenticated: payload.byteLength > 0 })
         this.armCloseTimer()
+    }
+
+    /**
+     * The LIMIT_EXCEEDED notice travels through the mailbox (a DATA frame the relay stores and pumps to
+     * the peer) while CLOSE is a control frame the relay forwards at once, so a CLOSE sent right away
+     * can overtake the notice and the destination would end CLOSED (STUDY_COMPLETE) instead of
+     * LIMIT_EXCEEDED. Wait for the notice's ACK, bounded by limitNoticeAckMs, before closing.
+     */
+    private sendCloseAfterLimitNotice(reason: string): void {
+        const noticeId = this.limitNoticeId
+        if (this.closing || !noticeId || !this.delivery.holds(noticeId)) return this.sendCloseBestEffort(reason)
+        const done = (): void => {
+            if (this.limitNoticeTimer) clearTimeout(this.limitNoticeTimer)
+            this.limitNoticeTimer = null
+            this.off('delivery', onDelivery)
+            this.sendCloseBestEffort(reason)
+        }
+        const onDelivery = (event: DeliveryEvent): void => {
+            if (event.type === 'acked' && event.messageId === noticeId) done()
+        }
+        this.on('delivery', onDelivery)
+        this.limitNoticeTimer = setTimeout(() => {
+            log.warn('channel.limit_notice_unacked', {
+                messageId: noticeId,
+                waitedMs: this.deps.tuning.limitNoticeAckMs,
+            })
+            done()
+        }, this.deps.tuning.limitNoticeAckMs)
+        this.limitNoticeTimer.unref?.()
     }
 
     private sendCloseBestEffort(reason: string): void {
@@ -398,7 +432,7 @@ export class Channel extends EventEmitter<ChannelEvents> {
         log.error('channel.limit_exceeded', { side: error.side, limit: error.limit, used: error.used, max: error.max })
         // Tell the destination through the authenticated channel, then stop for good.
         try {
-            this.delivery.sendControl('LIMIT_EXCEEDED', `${error.side}:${error.limit}`)
+            this.limitNoticeId = this.delivery.sendControl('LIMIT_EXCEEDED', `${error.side}:${error.limit}`)
         } catch (sendError) {
             log.warn('channel.limit_notice_not_sent', errorFields(sendError))
         }

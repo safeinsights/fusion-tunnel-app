@@ -54,6 +54,11 @@ export type Tuning = {
     blobMaxAttempts: number
     /** Keep the local API up this long after a terminal state so the RC can read the terminal body. */
     exitGraceMs: number
+    /**
+     * After a caps breach the source waits this long for the destination's ACK of the LIMIT_EXCEEDED
+     * notice before sending CLOSE, so the notice (mailbox) is not overtaken by the CLOSE (frame).
+     */
+    limitNoticeAckMs: number
 }
 
 // PROVISIONAL — §15.6, tune during load testing
@@ -79,6 +84,7 @@ export const TUNING_DEFAULTS: Readonly<Tuning> = Object.freeze({
     blobRetryMs: 500,
     blobMaxAttempts: 8,
     exitGraceMs: 5_000,
+    limitNoticeAckMs: 2_000,
 })
 
 export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze({
@@ -103,6 +109,7 @@ export const TUNING_ENV: Readonly<Record<keyof Tuning, string>> = Object.freeze(
     blobRetryMs: 'FUSION_BLOB_RETRY_MS',
     blobMaxAttempts: 'FUSION_BLOB_MAX_ATTEMPTS',
     exitGraceMs: 'FUSION_EXIT_GRACE_MS',
+    limitNoticeAckMs: 'FUSION_LIMIT_NOTICE_ACK_MS',
 })
 
 type Env = Record<string, string | undefined>
@@ -173,6 +180,7 @@ export const loadTuning = (env: Env = process.env): Tuning => {
         blobRetryMs: envPositiveInt(env, TUNING_ENV.blobRetryMs, TUNING_DEFAULTS.blobRetryMs),
         blobMaxAttempts: envPositiveInt(env, TUNING_ENV.blobMaxAttempts, TUNING_DEFAULTS.blobMaxAttempts),
         exitGraceMs: envPositiveInt(env, TUNING_ENV.exitGraceMs, TUNING_DEFAULTS.exitGraceMs),
+        limitNoticeAckMs: envPositiveInt(env, TUNING_ENV.limitNoticeAckMs, TUNING_DEFAULTS.limitNoticeAckMs),
     }
     if (tuning.reconnectMaxMs < tuning.reconnectMinMs) {
         throw new ConfigError(`${TUNING_ENV.reconnectMaxMs} must be >= ${TUNING_ENV.reconnectMinMs}`)
@@ -186,7 +194,6 @@ export type ServerConfig = {
 }
 
 export const DEFAULT_PORT = 3003
-
 export const loadConfig = (env: Env = process.env): ServerConfig => {
     const rawPort = env.PORT
     // PORT=0 is allowed so tests can bind an ephemeral port.

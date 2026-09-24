@@ -53,24 +53,25 @@ Every tunnel container runs `read_only` with no volumes; CI also starts the runt
 
 ### Environment
 
-| Variable                                          | Meaning                                                                                        | Default     |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ----------- |
-| `PORT`                                            | enclave-local listen port                                                                      | 3003        |
-| `FUSION_INLINE_CAP_BYTES`                         | above this plaintext size a message takes the blob path (the relay's ADMITTED limit overrides) | 262144      |
-| `FUSION_PAD_BUCKETS`                              | wire frame sizes for padding, ascending, ≤ 32768                                               | 1024…32768  |
-| `FUSION_INFLIGHT_MAX_MSGS` / `_BYTES`             | local window (ADMITTED overrides)                                                              | 64 / 32 MiB |
-| `FUSION_LONGPOLL_MS`                              | long-poll hold                                                                                 | 25000       |
-| `FUSION_HEARTBEAT_MS` / `FUSION_HEARTBEAT_MISSES` | relay heartbeat watchdog (ADMITTED cadence overrides; 0 = off)                                 | 30000 / 2   |
-| `FUSION_RECONNECT_MIN_MS` / `_MAX_MS`             | relay re-dial backoff                                                                          | 500 / 30000 |
-| `FUSION_TOKEN_REFRESH_LEAD_MS`                    | pre-fetch relay token / refresh credential this long before `exp`                              | 120000      |
-| `FUSION_STATUS_INTERVAL_MS`                       | BMA status report cadence (also on transitions, near a cap, and terminally)                    | 60000       |
-| `FUSION_PEERKEY_POLL_MS`                          | directory poll while the peer has not published                                                | 5000        |
-| `FUSION_CLOSE_TIMEOUT_MS`                         | bound on the CLOSE sequence                                                                    | 30000       |
-| `FUSION_HANDSHAKE_RETRY_MS` / `_MAX_ATTEMPTS`     | message-1 retry cadence / bound                                                                | 2000 / 300  |
-| `FUSION_BACKPRESSURE_RETRY_MS`                    | re-offer after relay BACKPRESSURE                                                              | 500         |
-| `FUSION_INBOX_MAX_BYTES`                          | bound on partially reassembled inbound bytes                                                   | 64 MiB      |
-| `FUSION_BLOB_RETRY_MS` / `_MAX_ATTEMPTS`          | blob store retry                                                                               | 500 / 8     |
-| `FUSION_EXIT_GRACE_MS`                            | keep the local API up after a terminal state                                                   | 5000        |
+| Variable                                          | Meaning                                                                                                               | Default     |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `PORT`                                            | enclave-local listen port                                                                                             | 3003        |
+| `FUSION_INLINE_CAP_BYTES`                         | above this plaintext size a message takes the blob path (the relay's ADMITTED limit overrides)                        | 262144      |
+| `FUSION_PAD_BUCKETS`                              | wire frame sizes for padding, ascending, ≤ 32768                                                                      | 1024…32768  |
+| `FUSION_INFLIGHT_MAX_MSGS` / `_BYTES`             | local window (ADMITTED overrides)                                                                                     | 64 / 32 MiB |
+| `FUSION_LONGPOLL_MS`                              | long-poll hold                                                                                                        | 25000       |
+| `FUSION_HEARTBEAT_MS` / `FUSION_HEARTBEAT_MISSES` | relay heartbeat watchdog (ADMITTED cadence overrides; 0 = off)                                                        | 30000 / 2   |
+| `FUSION_RECONNECT_MIN_MS` / `_MAX_MS`             | relay re-dial backoff                                                                                                 | 500 / 30000 |
+| `FUSION_TOKEN_REFRESH_LEAD_MS`                    | pre-fetch relay token / refresh credential this long before `exp`                                                     | 120000      |
+| `FUSION_STATUS_INTERVAL_MS`                       | BMA status report cadence (also on transitions, near a cap, and terminally)                                           | 60000       |
+| `FUSION_PEERKEY_POLL_MS`                          | directory poll while the peer has not published                                                                       | 5000        |
+| `FUSION_CLOSE_TIMEOUT_MS`                         | bound on the CLOSE sequence                                                                                           | 30000       |
+| `FUSION_HANDSHAKE_RETRY_MS` / `_MAX_ATTEMPTS`     | message-1 retry cadence / bound                                                                                       | 2000 / 300  |
+| `FUSION_BACKPRESSURE_RETRY_MS`                    | re-offer after relay BACKPRESSURE                                                                                     | 500         |
+| `FUSION_INBOX_MAX_BYTES`                          | bound on partially reassembled inbound bytes                                                                          | 64 MiB      |
+| `FUSION_BLOB_RETRY_MS` / `_MAX_ATTEMPTS`          | blob store retry                                                                                                      | 500 / 8     |
+| `FUSION_EXIT_GRACE_MS`                            | keep the local API up after a terminal state                                                                          | 5000        |
+| `FUSION_LIMIT_NOTICE_ACK_MS`                      | after a caps breach, wait for the peer's ACK of the LIMIT_EXCEEDED notice before CLOSE                                | 2000        |
 
 All tuning values are **provisional** (v2 §15.6) pending load testing against the real relay.
 

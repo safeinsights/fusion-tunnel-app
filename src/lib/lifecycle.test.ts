@@ -53,6 +53,16 @@ describe('Lifecycle', () => {
         expect(lifecycle.state).toBe('LIMIT_EXCEEDED')
     })
 
+    it('fail(LIMIT_EXCEEDED) is honoured while CLOSING (cap notice delivered after the peer CLOSE)', () => {
+        const lifecycle = new Lifecycle()
+        for (const state of ['CONFIGURED', 'PEER_KEY_VERIFIED', 'RELAY_ATTACHED', 'CHANNEL_UP', 'CLOSING'] as const) {
+            lifecycle.transition(state, 'test')
+        }
+        expect(lifecycle.fail('LIMIT_EXCEEDED', 'peer reported cap breach')?.to).toBe('LIMIT_EXCEEDED')
+        expect(lifecycle.terminalCode()).toBe('LIMIT_EXCEEDED')
+        expect(lifecycle.canTransition('CLOSED')).toBe(false)
+    })
+
     it('fail() refuses LIMIT_EXCEEDED before caps exist (AWAITING_CONFIG)', () => {
         const lifecycle = new Lifecycle()
         expect(lifecycle.fail('LIMIT_EXCEEDED', 'too early')).toBeUndefined()

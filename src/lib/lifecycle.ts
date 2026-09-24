@@ -27,7 +27,10 @@ const TRANSITIONS: Readonly<Record<TunnelState, readonly TunnelState[]>> = {
     PEER_KEY_VERIFIED: ['RELAY_ATTACHED', 'ERRORED', 'LIMIT_EXCEEDED'],
     RELAY_ATTACHED: ['CHANNEL_UP', 'ERRORED', 'LIMIT_EXCEEDED'],
     CHANNEL_UP: ['RELAY_ATTACHED', 'CLOSING', 'ERRORED', 'LIMIT_EXCEEDED'],
-    CLOSING: ['CLOSED', 'ERRORED'],
+    // CLOSING -> LIMIT_EXCEEDED: the source sends its LIMIT_EXCEEDED control through the mailbox and
+    // its CLOSE as a frame; the relay may forward the CLOSE first (store latency), so the cap notice
+    // can land while we are already CLOSING and must still end the leg as LIMIT_EXCEEDED, not CLOSED.
+    CLOSING: ['CLOSED', 'ERRORED', 'LIMIT_EXCEEDED'],
     CLOSED: [],
     ERRORED: [],
     LIMIT_EXCEEDED: [],
