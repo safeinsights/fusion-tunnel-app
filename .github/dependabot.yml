@@ -1,0 +1,34 @@
+# Dependabot keeps the SHA-pinned actions in .github/workflows/ and the hash-locked Semgrep
+# install in .github/semgrep/ current (see the security header in checks.yml). Application
+# dependencies are not tracked here, as in management-app: they follow the manual update
+# cadence plus pnpm's minimumReleaseAge. The 7-day cooldown gives a compromised upstream
+# release time to be noticed before a bump is proposed.
+version: 2
+updates:
+    - package-ecosystem: 'github-actions'
+      directory: '/'
+      schedule:
+          interval: 'weekly'
+          day: 'monday'
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 5
+      groups:
+          actions-minor-and-patch:
+              update-types:
+                  - 'minor'
+                  - 'patch'
+      labels:
+          - 'dependencies'
+          - 'github-actions'
+    - package-ecosystem: 'pip'
+      directory: '/.github/semgrep'
+      schedule:
+          interval: 'weekly'
+          day: 'monday'
+      cooldown:
+          default-days: 7
+      open-pull-requests-limit: 2
+      labels:
+          - 'dependencies'
+          - 'semgrep'
