@@ -1,46 +1,48 @@
+# SECURITY: this workflow runs on `pull_request`, so it executes PR-controlled code (pnpm
+# install scripts, build, tests). The same rules as management-app (OTTER-545) apply:
+#
+#   1. Every `actions/checkout` sets `persist-credentials: false` so no usable GITHUB_TOKEN is
+#      left on disk for a malicious install script or test fixture to read.
+#   2. Every job's `permissions:` block is the minimum that job needs.
+#   3. Third-party actions are pinned to commit SHAs (version tag in a trailing comment) and
+#      Semgrep to a hash-locked requirements file, so nothing can be repointed underneath
+#      us. Dependabot (.github/dependabot.yml) keeps the pins current.
+#
+# The scanners (Trivy, Semgrep) run in their own jobs, apart from the job that runs pnpm
+# install, so PR-supplied code never executes alongside a scanner. Neither scanner needs a
+# secret, which is also why they run unchanged on fork and Dependabot PRs.
 name: Checks
 on:
     push:
         branches: [main]
     pull_request:
 
-permissions:
-    contents: read
+# A newer PR commit cancels the older run. Push runs get a unique group so they always finish.
+concurrency:
+    group: ${{ github.event_name == 'pull_request' && format('checks-{0}', github.ref) || format('checks-{0}', github.run_id) }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-    all:
+    checks:
+        name: Lint, typecheck, test, build
         timeout-minutes: 60
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         steps:
-            - uses: actions/checkout@v6
-            - uses: pnpm/action-setup@v6
-            - uses: actions/setup-node@v6
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
-                  node-version: lts/*
+                  persist-credentials: false
+            - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+            - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  # The node:22 runtime image's major, rather than whatever lts/* resolves to.
+                  node-version: 22
                   cache: 'pnpm'
             - name: Install dependencies
               run: pnpm install --frozen-lockfile
             - name: Lint
               run: pnpm run lint
-            - name: Run Trivy vulnerability scanner in fs mode
-              uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
-              with:
-                  scan-type: 'fs'
-                  scan-ref: '.'
-                  trivy-config: trivy.yaml
-            - name: Run Trivy license scanner
-              uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
-              with:
-                  scan-type: 'fs'
-                  scan-ref: '.'
-                  scanners: 'license'
-                  severity: 'HIGH,CRITICAL'
-                  exit-code: '1'
-            - name: Run SonarQube SAST Scan
-              uses: SonarSource/sonarqube-scan-action@v6
-              env:
-                  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-                  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
             - name: Typecheck
               run: pnpm run typecheck
             - name: Unit Test
@@ -68,18 +70,107 @@ jobs:
     # The compose stacks are the regression bed the real relay and BMA are later swapped into.
     # Kept as a separate job so unit CI stays fast; `run` returns the destination RC's exit code.
     compose-smoke:
-        needs: all
+        needs: checks
         timeout-minutes: 25
         runs-on: ubuntu-latest
+        permissions:
+            contents: read
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
             - name: Two-party stack
+              id: two-party
               run: docker compose --profile two-party run --build --rm rc-dst
+            # `run` attaches only to rc-dst, so a failure in setup or a tunnel is invisible without
+            # the other containers' logs. Dump them before the stack is torn down.
+            - name: Two-party stack logs (on failure)
+              if: failure() && steps.two-party.outcome == 'failure'
+              run: |
+                  docker compose --profile two-party ps -a
+                  docker compose --profile two-party logs --no-color --timestamps
             - name: Tear down
               if: always()
               run: docker compose --profile two-party down -v --remove-orphans
             - name: Hub stack
+              id: hub
               run: docker compose --env-file compose.hub.env --profile hub run --build --rm rc-dst-hub
+            - name: Hub stack logs (on failure)
+              if: failure() && steps.hub.outcome == 'failure'
+              run: |
+                  docker compose --env-file compose.hub.env --profile hub ps -a
+                  docker compose --env-file compose.hub.env --profile hub logs --no-color --timestamps
             - name: Tear down hub
               if: always()
               run: docker compose --env-file compose.hub.env --profile hub down -v --remove-orphans
+
+    trivy:
+        name: Trivy (vulnerabilities, secrets, licenses)
+        timeout-minutes: 15
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            # Trivy downloads its binary and vulnerability DB on every run and flakes when an
+            # upstream fetch fails. Pinning `version` keeps trivy-action's built-in cache key
+            # stable across runs, and one shared `cache-dir` means the DB is fetched at most
+            # once per run. A version bump naturally busts the cache.
+            - name: Run Trivy vulnerability scanner in fs mode
+              uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+              with:
+                  scan-type: 'fs'
+                  scan-ref: '.'
+                  trivy-config: trivy.yaml
+                  version: v0.70.0
+                  cache-dir: ${{ github.workspace }}/.cache/trivy
+            - name: Run Trivy license scanner
+              uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+              with:
+                  scan-type: 'fs'
+                  scan-ref: '.'
+                  scanners: 'license'
+                  severity: 'HIGH,CRITICAL'
+                  exit-code: '1'
+                  version: v0.70.0
+                  cache-dir: ${{ github.workspace }}/.cache/trivy
+
+    # SAST with Semgrep Community Edition: public rulesets, no account, no token, so there is
+    # nothing here to steal. `--error` fails the job on any finding. Silence a false positive
+    # in the source with `// nosemgrep: <rule-id>` plus a one-line reason, never by loosening
+    # this command. .semgrepignore lists what is not scanned (tests, test tooling, build output).
+    semgrep:
+        name: Semgrep SAST
+        timeout-minutes: 10
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+              with:
+                  python-version: '3.12'
+            # Hash-locked install, the pip equivalent of a SHA pin: neither semgrep nor a
+            # transitive dependency can change underneath us. Dependabot's pip entry keeps the
+            # lock current; .github/semgrep/semgrep.in says how to regenerate it by hand.
+            - name: Install Semgrep
+              run: pip install --quiet --require-hashes --requirement .github/semgrep/requirements.txt
+            # p/ci is Semgrep's curated high-confidence set; the language, Dockerfile and GitHub
+            # Actions packs add the remaining rules for what this repo contains. The pnpm
+            # release-age rule wants a 7-day cooldown, but the org standard is 2 days
+            # (minimumReleaseAge: 2880 in every pnpm repo, management-app included), so that
+            # rule is excluded here rather than the setting changed.
+            - name: Semgrep
+              run: >-
+                  semgrep scan
+                  --config p/ci
+                  --config p/typescript
+                  --config p/nodejs
+                  --config p/dockerfile
+                  --config p/github-actions
+                  --exclude-rule package_managers.pnpm.pnpm-missing-minimum-release-age.pnpm-minimum-release-age
+                  --metrics=off --error --text .

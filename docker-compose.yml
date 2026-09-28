@@ -116,6 +116,10 @@ services:
         depends_on:
             setup:
                 condition: service_completed_successfully
+            # Nothing else depends on the hub-only tunnels, so without this `compose run rc-dst-hub`
+            # never starts them and setup waits on tunnel-src-b's health forever.
+            tunnel-src-b:
+                condition: service_healthy
         networks: [enclave-b]
 
     # ---- destination enclave (one tunnel per leg) --------------------------------------------
@@ -167,6 +171,8 @@ services:
                 condition: service_started
             rc-src-b:
                 condition: service_started
+            tunnel-dst-b:
+                condition: service_healthy
         networks: [enclave-dst]
 
     # ---- the (single, harness) Setup App: provisions every tunnel over its local API -------
