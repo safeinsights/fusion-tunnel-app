@@ -80,12 +80,26 @@ jobs:
               with:
                   persist-credentials: false
             - name: Two-party stack
+              id: two-party
               run: docker compose --profile two-party run --build --rm rc-dst
+            # `run` attaches only to rc-dst, so a failure in setup or a tunnel is invisible without
+            # the other containers' logs. Dump them before the stack is torn down.
+            - name: Two-party stack logs (on failure)
+              if: failure() && steps.two-party.outcome == 'failure'
+              run: |
+                  docker compose --profile two-party ps -a
+                  docker compose --profile two-party logs --no-color --timestamps
             - name: Tear down
               if: always()
               run: docker compose --profile two-party down -v --remove-orphans
             - name: Hub stack
+              id: hub
               run: docker compose --env-file compose.hub.env --profile hub run --build --rm rc-dst-hub
+            - name: Hub stack logs (on failure)
+              if: failure() && steps.hub.outcome == 'failure'
+              run: |
+                  docker compose --env-file compose.hub.env --profile hub ps -a
+                  docker compose --env-file compose.hub.env --profile hub logs --no-color --timestamps
             - name: Tear down hub
               if: always()
               run: docker compose --env-file compose.hub.env --profile hub down -v --remove-orphans
