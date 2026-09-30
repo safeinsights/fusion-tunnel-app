@@ -6,7 +6,7 @@ import antiTrojanSource from 'eslint-plugin-anti-trojan-source'
 
 export default tseslint.config(
     {
-        ignores: ['dist/', 'coverage/'],
+        ignores: ['dist/', 'coverage/', '.github/semgrep/.venv/'],
     },
     js.configs.recommended,
     ...tseslint.configs.recommended,

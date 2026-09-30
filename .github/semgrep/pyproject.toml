@@ -1,0 +1,12 @@
+# Semgrep for the `semgrep` job in .github/workflows/checks.yml. uv.lock next to this file pins
+# Semgrep and every transitive dependency with hashes, the uv equivalent of a SHA-pinned action,
+# and the job installs it with `uv sync --locked`. To bump Semgrep: change the version below,
+# run `uv lock --project .github/semgrep` from the repo root, commit both files. Dependabot does
+# not manage this lock: Semgrep pins its own dependencies tightly, so single-package bumps
+# cannot resolve. There is deliberately no uv-specific config table and no build system: the
+# project is virtual (nothing of ours is built or installed).
+[project]
+name = "semgrep-ci"
+version = "0"
+requires-python = ">=3.12"
+dependencies = ["semgrep==1.178.0"]

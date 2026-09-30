@@ -4,6 +4,9 @@ format: table
 exit-code: 1
 debug: false
 timeout: 5m
+# The vulnerability scan does not load .trivyignore.yaml by itself; point it there so the
+# time-boxed, path-scoped suppressions in that file apply.
+ignorefile: .trivyignore.yaml
 severity:
     - HIGH
     - CRITICAL
@@ -15,6 +18,7 @@ scan:
         - .git
         - .husky
         - node_modules
+        - .github/semgrep/.venv
     skip-files:
         - .env
 misconfiguration:

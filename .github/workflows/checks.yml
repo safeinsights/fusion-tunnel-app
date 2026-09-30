@@ -5,7 +5,7 @@
 #      left on disk for a malicious install script or test fixture to read.
 #   2. Every job's `permissions:` block is the minimum that job needs.
 #   3. Third-party actions are pinned to commit SHAs (version tag in a trailing comment) and
-#      Semgrep to a hash-locked requirements file, so nothing can be repointed underneath
+#      Semgrep to a hash-locked uv.lock, so nothing can be repointed underneath
 #      us. Dependabot (.github/dependabot.yml) keeps the pins current.
 #
 # The scanners (Trivy, Semgrep) run in their own jobs, apart from the job that runs pnpm
@@ -134,6 +134,7 @@ jobs:
                   scanners: 'license'
                   severity: 'HIGH,CRITICAL'
                   exit-code: '1'
+                  trivyignores: '.trivyignore.yaml'
                   version: v0.70.0
                   cache-dir: ${{ github.workspace }}/.cache/trivy
 
@@ -151,14 +152,13 @@ jobs:
             - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
               with:
                   persist-credentials: false
-            - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-              with:
-                  python-version: '3.12'
-            # Hash-locked install, the pip equivalent of a SHA pin: neither semgrep nor a
-            # transitive dependency can change underneath us. Dependabot's pip entry keeps the
-            # lock current; .github/semgrep/semgrep.in says how to regenerate it by hand.
+            - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+            # .github/semgrep is a tiny uv project whose uv.lock pins Semgrep and every transitive
+            # dependency with hashes, the uv equivalent of a SHA pin; `--locked` refuses to run if
+            # the lock and pyproject disagree. Bumping Semgrep is a by-hand edit of that pyproject
+            # plus `uv lock --project .github/semgrep`. Dependabot does not manage this lock.
             - name: Install Semgrep
-              run: pip install --quiet --require-hashes --requirement .github/semgrep/requirements.txt
+              run: uv sync --locked --project .github/semgrep
             # p/ci is Semgrep's curated high-confidence set; the language, Dockerfile and GitHub
             # Actions packs add the remaining rules for what this repo contains. The pnpm
             # release-age rule wants a 7-day cooldown, but the org standard is 2 days
@@ -166,7 +166,7 @@ jobs:
             # rule is excluded here rather than the setting changed.
             - name: Semgrep
               run: >-
-                  semgrep scan
+                  uv run --locked --project .github/semgrep semgrep scan
                   --config p/ci
                   --config p/typescript
                   --config p/nodejs
