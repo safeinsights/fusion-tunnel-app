@@ -1,7 +1,7 @@
 # Trivy suppressions. trivy.yaml points the vulnerability scan here (`ignorefile`) and the
 # license step passes it as `trivyignores` (see .github/workflows/checks.yml). Every entry
-# carries a statement and, for vulnerabilities, an expiry: Trivy fails the scan again once
-# the date passes, which is the intended review trigger.
+# carries a statement and, for vulnerabilities, an expiry: Trivy drops an entry at 00:00 UTC
+# on the expiry date, so the scan fails again from that day; that is the intended review trigger.
 vulnerabilities:
     # pyjwt 2.13.0 in the Semgrep lock (.github/semgrep/uv.lock): fixed in 2.14.0, but
     # Semgrep 1.178.0 pins pyjwt~=2.13.0, so the lock cannot take the fix until Semgrep lifts the
@@ -10,27 +10,27 @@ vulnerabilities:
     # Semgrep and delete these entries when a release allows pyjwt >= 2.14.0.
     - id: CVE-2026-102268
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
     - id: CVE-2026-102266
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
     - id: CVE-2026-102267
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
     - id: CVE-2026-102271
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
     - id: CVE-2026-102272
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
     - id: CVE-2026-102273
       paths: ['.github/semgrep/uv.lock']
-      expired_at: 2026-10-31
+      expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
 
 licenses: []
