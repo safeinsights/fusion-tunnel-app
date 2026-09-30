@@ -6,6 +6,7 @@
 # flag in real code.
 .git/
 node_modules/
+.venv/
 dist/
 coverage/
 tests/

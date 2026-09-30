@@ -1,4 +1,0 @@
-# Semgrep for the `semgrep` job in .github/workflows/checks.yml. The hash-locked
-# requirements.txt next to this file is generated from it (command in its header) so the
-# install is as immutable as a SHA-pinned action; Dependabot's pip entry keeps both current.
-semgrep==1.178.0

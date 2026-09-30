@@ -5,3 +5,4 @@ coverage/
 dist/
 test-results/
 .claude/
+.github/semgrep/.venv/

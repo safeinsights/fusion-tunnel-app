@@ -18,6 +18,7 @@ scan:
         - .git
         - .husky
         - node_modules
+        - .venv
     skip-files:
         - .env
 misconfiguration:
