@@ -134,6 +134,7 @@ jobs:
                   scanners: 'license'
                   severity: 'HIGH,CRITICAL'
                   exit-code: '1'
+                  trivyignores: '.trivyignore.yaml'
                   version: v0.70.0
                   cache-dir: ${{ github.workspace }}/.cache/trivy
 
