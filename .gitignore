@@ -1,0 +1,28 @@
+# Environment files
+.env
+
+# System files
+.DS_Store
+.idea
+
+# Logs
+*.log
+npm-debug.log*
+
+# Temporary files and directories
+tmp/
+node_modules/
+.npm
+.pnpm-store/
+*.tsbuildinfo
+.eslintcache
+
+# Build outputs
+dist/
+coverage/
+
+# Test results
+test-results/
+
+# Security keys
+*.pem

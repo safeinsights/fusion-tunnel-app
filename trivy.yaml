@@ -1,0 +1,24 @@
+# 'table' prints a compact, human-readable summary in CI logs. JSON dumped thousands of
+# lines per run and was impossible to scan by eye; nothing downstream consumes the output.
+format: table
+exit-code: 1
+debug: false
+timeout: 5m
+severity:
+    - HIGH
+    - CRITICAL
+scan:
+    scanners:
+        - vuln
+        - secret
+    skip-dirs:
+        - .git
+        - .husky
+        - node_modules
+    skip-files:
+        - .env
+misconfiguration:
+    scanners:
+        - dockerfile
+pkg:
+    include-dev-deps: true

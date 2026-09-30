@@ -1,0 +1,13 @@
+# Paths Semgrep does not scan (see the semgrep job in .github/workflows/checks.yml).
+# This file REPLACES Semgrep's built-in default exclusions, so the usual build and dependency
+# directories are restated here; .gitignore is honoured separately. Tests and the testing/
+# harness are not shipped (the runtime image copies only dist/ and production node_modules),
+# and their fixtures (fake tokens, hosts without TLS) are exactly what the rules exist to
+# flag in real code.
+.git/
+node_modules/
+dist/
+coverage/
+tests/
+testing/
+**/*.test.ts
