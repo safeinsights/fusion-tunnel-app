@@ -32,5 +32,14 @@ vulnerabilities:
       paths: ['.github/semgrep/uv.lock']
       expired_at: 2026-11-01
       statement: pyjwt is reachable only through Semgrep login/app-token flows, which `semgrep scan` never uses; Semgrep 1.178.0 pins pyjwt~=2.13.0
+    # braces 3.0.3 in pnpm-lock.yaml: a stack-overflow denial of service with no fixed release
+    # yet (3.0.3 is the latest). It is a dev-only transitive dependency
+    # (eslint-plugin-anti-trojan-source > anti-trojan-source > globby > fast-glob > micromatch),
+    # so it never enters the runtime image, and the only glob patterns it expands are the
+    # repo's own lint file lists. Upgrade and delete this entry when a fixed braces ships.
+    - id: CVE-2026-93687
+      paths: ['pnpm-lock.yaml']
+      expired_at: 2026-11-01
+      statement: braces is a dev-only transitive dependency of eslint-plugin-anti-trojan-source, absent from the runtime image, and only expands the repo's own lint globs; no fixed version exists
 
 licenses: []
