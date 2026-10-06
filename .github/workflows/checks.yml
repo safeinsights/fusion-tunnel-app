@@ -11,6 +11,15 @@
 # The scanners (Trivy, Semgrep) run in their own jobs, apart from the job that runs pnpm
 # install, so PR-supplied code never executes alongside a scanner. Neither scanner needs a
 # secret, which is also why they run unchanged on fork and Dependabot PRs.
+#
+# Exception to rule 2: the `publish` job holds `contents: write` and the Harbor robot
+# credentials. That is OTTER-545-safe because it runs ONLY on push to main (it `needs:` every
+# other job and is guarded by both the event and `github.ref == 'refs/heads/main'`): trusted,
+# post-merge code that a PR or fork can never trigger. It runs no pnpm install and no app or test
+# code on the runner (the Dockerfile's build stage runs the lockfile-pinned install inside
+# BuildKit, which sees neither the runner environment nor its secrets). The Harbor secrets live
+# in the `harbor` GitHub environment, whose deployment-branch policy allows `main` only, so a PR
+# that edited the guard out of this file still could not obtain them. See the job for details.
 name: Checks
 on:
     push:
@@ -174,3 +183,270 @@ jobs:
                   --config p/github-actions
                   --exclude-rule package_managers.pnpm.pnpm-missing-minimum-release-age.pnpm-minimum-release-age
                   --metrics=off --error --text .
+
+    # Advisory only: on a PR that touches runtime-relevant paths without bumping package.json
+    # `version`, warn that the merge will publish nothing (the publish job below skips versions
+    # Harbor already has). Never fails (`continue-on-error`, so an API hiccup cannot turn an
+    # advisory red). Read-only: it compares against the PR base through the GitHub API rather
+    # than `git fetch`, which has no credentials after `persist-credentials: false`. The base is
+    # the first parent of the checked-out merge commit, i.e. the main this PR was actually merged
+    # onto; `pull_request.base.sha` goes stale when main moves and the run is re-run. A
+    # scripts-only or version-only package.json edit does not count as a dependency change.
+    version-bump-advisory:
+        name: Version bump advisory
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 5
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - name: Compare version and dependencies with the PR base
+              continue-on-error: true
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  BASE_SHA: ${{ github.event.pull_request.base.sha }}
+                  PR_NUMBER: ${{ github.event.pull_request.number }}
+              run: |
+                  merge_base="$(gh api "repos/${GITHUB_REPOSITORY}/commits/$GITHUB_SHA" --jq '.parents[0].sha' 2>/dev/null || true)"
+                  gh api -H 'Accept: application/vnd.github.raw+json' \
+                      "repos/${GITHUB_REPOSITORY}/contents/package.json?ref=${merge_base:-$BASE_SHA}" > "$RUNNER_TEMP/base-package.json"
+                  changed="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+                  relevant="$(printf '%s\n' "$changed" | grep -E '^(src/|Dockerfile$|\.dockerignore$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|tsconfig\.json$)' || true)"
+                  deps_changed="$(node -e '
+                      const pick = (p) => { const j = require(p); return JSON.stringify([j.dependencies, j.devDependencies]) }
+                      console.log(pick(process.env.RUNNER_TEMP + "/base-package.json") !== pick(process.cwd() + "/package.json"))
+                  ')"
+                  base_version="$(node -p "require(process.env.RUNNER_TEMP + '/base-package.json').version")"
+                  head_version="$(node -p "require('./package.json').version")"
+                  if [[ ( -n "$relevant" || "$deps_changed" == "true" ) && "$base_version" == "$head_version" ]]; then
+                      msg="package.json version is still $head_version but src/, the Dockerfile, dependencies, the lockfile or build config changed. Merging will publish no image; bump the version if this should ship."
+                      echo "::warning title=Version not bumped::$msg"
+                      echo "**Version not bumped:** $msg" >> "$GITHUB_STEP_SUMMARY"
+                  else
+                      echo "Version: $base_version -> $head_version; relevant changes: ${relevant:-none}; deps changed: $deps_changed" >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
+    # SECURITY (OTTER-545): publishes the runtime image to Harbor and cuts the matching GitHub
+    # release. This job holds `contents: write` and the Harbor robot credentials, but it is safe
+    # because:
+    #   - it runs ONLY on push to main: `needs:` every other job, plus the event + ref guard (the
+    #     same belt-and-braces as management-app's coverage-baseline job). A PR or fork can never
+    #     trigger it; on PR runs the job is skipped, which branch protection counts as success;
+    #   - the Harbor secrets live in the `harbor` GitHub environment whose deployment-branch
+    #     policy allows `main` only, so even a PR that edits the guard out of this file cannot
+    #     obtain them: GitHub refuses the environment for a non-main ref;
+    #   - it runs NO `pnpm install` and NO app/test code on the runner. `docker build` runs the
+    #     lockfile-pinned install inside BuildKit, which sees neither the runner environment nor
+    #     its secrets. The host only runs node -p, curl, docker and gh;
+    #   - the credentials are in scope for the `docker login` step alone, and `docker logout`
+    #     runs unconditionally so nothing is left in ~/.docker/config.json;
+    #   - `contents: write` exists only for `gh release create`; every expression reaches a
+    #     script through `env:`, never by interpolation into `run:`.
+    # Versioning: the image tag is `version` from package.json, bumped in the PR. If Harbor
+    # already has that tag (Dependabot and CI-only merges), the image steps are skipped; the
+    # release step is gated separately so a re-run after a partial failure finishes the job
+    # instead of skipping it. `latest` follows the version on main, not the SHA: it moves when
+    # main's package.json still carries this run's version and Harbor's `latest` is not already
+    # that image. So a re-run of an older run republishes its own version but never regresses
+    # `latest`, and a version whose own run lost the race to a later non-bumping merge (or whose
+    # `latest` push failed) still gets `latest` moved by the next run.
+    # Do NOT add a `pull_request` trigger, a same-repo-PR gate, or a PR-head checkout here.
+    publish:
+        name: Publish image to Harbor
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        needs: [checks, compose-smoke, trivy, semgrep]
+        # Serialise publishes from concurrent main merges; their test jobs still run in parallel.
+        # `queue: max` keeps every queued publish (cancel-in-progress: false would drop an older
+        # pending run, and with it a version). management-app's coverage-baseline job uses the
+        # same key; actionlint 1.7.x does not know it yet and reports it as unexpected.
+        concurrency:
+            group: publish-main
+            queue: max
+        environment: harbor
+        timeout-minutes: 30
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        env:
+            HARBOR_HOST: harbor.safeinsights.org
+            IMAGE: harbor.safeinsights.org/safeinsights-public/fusion-tunnel-app
+        steps:
+            - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+            - name: Read version from package.json
+              id: version
+              run: |
+                  version="$(node -p "require('./package.json').version")"
+                  if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                      echo "::error::package.json version '$version' is not MAJOR.MINOR.PATCH"
+                      exit 1
+                  fi
+                  echo "version=$version" >> "$GITHUB_OUTPUT"
+            # Anonymous read against the public project, so a no-op run never touches a secret.
+            # 200 = already published (skip the image steps), 404 = not there yet (also the very
+            # first push, when the repository itself does not exist), anything else is an outage
+            # that must not be papered over. `latest` is looked up the same way so the job can tell
+            # whether it already points at this version's image.
+            - name: Check whether Harbor already has this version
+              id: harbor
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  # Prints the artifact's digest, or nothing when Harbor does not have the tag.
+                  digest_of() {
+                      local code
+                      code="$(curl -sS --retry 3 --max-time 30 -o "$RUNNER_TEMP/artifact.json" -w '%{http_code}' \
+                          "https://$HARBOR_HOST/api/v2.0/projects/safeinsights-public/repositories/fusion-tunnel-app/artifacts/$1")"
+                      case "$code" in
+                          200) jq -er '.digest' "$RUNNER_TEMP/artifact.json" ;;
+                          404) ;;
+                          *)
+                              echo "::error::Harbor returned HTTP $code for $IMAGE:$1" >&2
+                              return 1
+                              ;;
+                      esac
+                  }
+                  version_digest="$(digest_of "$VERSION")"
+                  latest_digest="$(digest_of latest)"
+                  if [[ -n "$version_digest" ]]; then
+                      echo "image-exists=true" >> "$GITHUB_OUTPUT"
+                      echo "$IMAGE:$VERSION already exists; it will not be rebuilt."
+                  else
+                      echo "image-exists=false" >> "$GITHUB_OUTPUT"
+                  fi
+                  if [[ -n "$version_digest" && "$version_digest" == "$latest_digest" ]]; then
+                      echo "latest-is-version=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "latest-is-version=false" >> "$GITHUB_OUTPUT"
+                  fi
+            # A tag that already points at a different commit means a version number was reused:
+            # a human mistake to surface, not to paper over.
+            - name: Check whether the GitHub release exists
+              id: release
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  if gh release view "v$VERSION" --json tagName >/dev/null 2>&1; then
+                      echo "release-exists=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "release-exists=false" >> "$GITHUB_OUTPUT"
+                      tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v$VERSION" --jq '.object.sha' 2>/dev/null || true)"
+                      if [[ -n "$tag_sha" && "$tag_sha" != "$GITHUB_SHA" ]]; then
+                          echo "::error::tag v$VERSION already points at $tag_sha, not $GITHUB_SHA. Bump the version."
+                          exit 1
+                      fi
+                  fi
+            - name: Decide whether :latest should move
+              id: latest
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ steps.version.outputs.version }}
+                  LATEST_IS_VERSION: ${{ steps.harbor.outputs.latest-is-version }}
+              run: |
+                  main_version="$(gh api -H 'Accept: application/vnd.github.raw+json' \
+                      "repos/${GITHUB_REPOSITORY}/contents/package.json?ref=main" | jq -r '.version')"
+                  if [[ "$main_version" != "$VERSION" ]]; then
+                      echo "move=false" >> "$GITHUB_OUTPUT"
+                      echo "main is at $main_version, not $VERSION; :latest will not move."
+                  elif [[ "$LATEST_IS_VERSION" == "true" ]]; then
+                      echo "move=false" >> "$GITHUB_OUTPUT"
+                      echo ":latest already is $VERSION."
+                  else
+                      echo "move=true" >> "$GITHUB_OUTPUT"
+                  fi
+            - name: Build runtime image
+              if: steps.harbor.outputs.image-exists == 'false'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: docker build --platform linux/amd64 --target runtime -t "$IMAGE:$VERSION" .
+            # Already published by an earlier run that could not move :latest; fetch it (anonymous,
+            # public project) so it can be re-tagged.
+            - name: Pull the published image to re-tag as latest
+              if: steps.harbor.outputs.image-exists == 'true' && steps.latest.outputs.move == 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: docker pull --platform linux/amd64 "$IMAGE:$VERSION"
+            # The only step that can see the Harbor credentials.
+            - name: Log in to Harbor
+              if: steps.harbor.outputs.image-exists == 'false' || steps.latest.outputs.move == 'true'
+              env:
+                  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+                  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+              run: |
+                  if [[ -z "$HARBOR_USERNAME" || -z "$HARBOR_PASSWORD" ]]; then
+                      echo "::error::HARBOR_USERNAME / HARBOR_PASSWORD are not set in the 'harbor' environment (see README, Releasing)."
+                      exit 1
+                  fi
+                  echo "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" --username "$HARBOR_USERNAME" --password-stdin
+            - name: Push image
+              id: push
+              if: steps.harbor.outputs.image-exists == 'false' || steps.latest.outputs.move == 'true'
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  IMAGE_EXISTS: ${{ steps.harbor.outputs.image-exists }}
+                  MOVE_LATEST: ${{ steps.latest.outputs.move }}
+              run: |
+                  if [[ "$IMAGE_EXISTS" == "false" ]]; then
+                      docker push "$IMAGE:$VERSION"
+                  fi
+                  if [[ "$MOVE_LATEST" == "true" ]]; then
+                      docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+                      docker push "$IMAGE:latest"
+                  else
+                      echo "Leaving :latest untouched."
+                  fi
+            - name: Log out of Harbor
+              if: always()
+              run: docker logout "$HARBOR_HOST" || true
+            - name: Tag and release
+              id: create-release
+              if: steps.release.outputs.release-exists == 'false'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  VERSION: ${{ steps.version.outputs.version }}
+              run: |
+                  gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes \
+                      --notes "Image: \`$IMAGE:$VERSION\`"
+            # Runs on failure too: the README tells whoever re-runs a failed publish to read here
+            # which half landed, so this reports step outcomes rather than intentions.
+            - name: Summary
+              if: always()
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  IMAGE_EXISTS: ${{ steps.harbor.outputs.image-exists }}
+                  RELEASE_EXISTS: ${{ steps.release.outputs.release-exists }}
+                  MOVE_LATEST: ${{ steps.latest.outputs.move }}
+                  PUSH_OUTCOME: ${{ steps.push.outcome }}
+                  RELEASE_OUTCOME: ${{ steps.create-release.outcome }}
+              run: |
+                  {
+                      echo "### Publish ${VERSION:-(version unreadable)}"
+                      if [[ "$PUSH_OUTCOME" == "success" ]]; then
+                          if [[ "$IMAGE_EXISTS" == "false" ]]; then
+                              echo "- image: pushed \`$IMAGE:$VERSION\`"
+                          else
+                              echo "- image: \`$IMAGE:$VERSION\` was already in Harbor"
+                          fi
+                          if [[ "$MOVE_LATEST" == "true" ]]; then
+                              echo "- latest: moved to $VERSION"
+                          else
+                              echo "- latest: left untouched"
+                          fi
+                      elif [[ "$PUSH_OUTCOME" == "skipped" && "$IMAGE_EXISTS" == "true" ]]; then
+                          echo "- image: \`$IMAGE:$VERSION\` was already in Harbor, skipped"
+                      else
+                          echo "- image: NOT pushed completely (push step: ${PUSH_OUTCOME:-not reached}); re-run the job"
+                      fi
+                      if [[ "$RELEASE_EXISTS" == "true" ]]; then
+                          echo "- release: v$VERSION already existed"
+                      elif [[ "$RELEASE_OUTCOME" == "success" ]]; then
+                          echo "- release: created v$VERSION"
+                      else
+                          echo "- release: NOT created (release step: ${RELEASE_OUTCOME:-not reached}); re-run the job"
+                      fi
+                  } >> "$GITHUB_STEP_SUMMARY"
