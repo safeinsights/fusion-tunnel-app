@@ -80,14 +80,55 @@ All tuning values are **provisional** (v2 §15.6) pending load testing against t
 
 `FUSION_ROLE` (`source|destination`); one leg: `FUSION_TUNNEL_ENDPOINT` + `FUSION_TUNNEL_TOKEN`; N legs at the hub: `FUSION_TUNNEL_ENDPOINTS` + `FUSION_TUNNEL_TOKENS` JSON maps keyed by leg label. `GET /v1/info` returns `{legId, peerOrgSlug, role, direction, state, caps, guards?, operations?, apiVersion}` so a peer-addressed SDK maps each endpoint to a peer.
 
-## Releasing
+## CI/CD
+
+One workflow, `.github/workflows/checks.yml`, runs on every PR and on every push to `main`. It is written to be copied into other SafeInsights app repos; the security rules it follows are management-app's (OTTER-545) and are spelled out in the header comment of the file. The short version: every checkout has `persist-credentials: false`, every job has the minimum `permissions:`, every third-party action is pinned to a commit SHA, scanners run in jobs of their own so PR code never executes next to them, and nothing a PR can reach holds a secret.
+
+### What runs
+
+| Job                     | On        | What it does                                                                                                                                                                                                                                                                     |
+| ----------------------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `checks`                | PR + main | `pnpm install --frozen-lockfile`, then `pnpm run lint`, `typecheck`, `test`, `build`; builds the Dockerfile's `runtime` target and smoke-tests it with `--read-only`.                                                                                                            |
+| `compose-smoke`         | PR + main | Runs the two-party and hub `docker compose` stacks end to end. App-specific; drop or replace it in another repo.                                                                                                                                                                 |
+| `trivy`                 | PR + main | Vulnerabilities and secrets (`trivy.yaml`), then licenses, HIGH/CRITICAL fail. Suppressions live in `.trivyignore.yaml`, each path-scoped, with an expiry date and a statement.                                                                                                  |
+| `semgrep`               | PR + main | Semgrep CE SAST with `p/ci`, `p/typescript`, `p/nodejs`, `p/dockerfile`, `p/github-actions`; any finding fails. Installed from the hash-locked `.github/semgrep/uv.lock`. Exclusions in `.semgrepignore`; false positives get an inline `// nosemgrep: <rule-id>` with a reason. |
+| `version-bump-advisory` | PR only   | Warns (never fails) when runtime-relevant paths or dependencies changed without a `package.json` version bump, because such a merge publishes nothing.                                                                                                                           |
+| `publish`               | main only | `needs:` all of the above. Publishes the image and cuts the GitHub release; see Releasing. The only job with `contents: write` and the only one that can read the Harbor credentials.                                                                                            |
+
+Dependabot (`.github/dependabot.yml`) bumps the SHA-pinned actions weekly with a 7-day cooldown. It does not manage application dependencies (manual cadence plus pnpm's `minimumReleaseAge`) or the Semgrep lock (`uv lock --project .github/semgrep` by hand after editing the pin in its `pyproject.toml`).
+
+### Releasing
 
 Images are published by CI, never by hand. The image tag is `version` in `package.json`, so a release is a PR that bumps it (semver: patch for fixes, minor for new behaviour, major for a Local API or relay wire break).
 
-- **On merge to main**, once every check is green, the `publish` job builds the `runtime` target and pushes `harbor.safeinsights.org/safeinsights-public/fusion-tunnel-app:<version>`, moves `:latest` to it while main still carries that version, then creates the `v<version>` git tag and a GitHub Release with generated notes.
-- **Merges that do not bump the version publish nothing** (Dependabot, CI-only or docs-only changes): the job sees the tag already in Harbor and skips the image steps. A PR-only advisory check warns, without failing, when `src/`, the `Dockerfile`, dependencies, the lockfile or build config (`tsconfig.json`, `pnpm-workspace.yaml`, `.dockerignore`) changed and the version did not.
+- **On merge to main**, once every check is green, the `publish` job builds the `runtime` target and pushes `harbor.safeinsights.org/safeinsights-public/fusion-tunnel-app:<version>`, moves `:latest` to it while main still carries that version, then creates the `v<version>` git tag and a GitHub Release with generated notes. The first publish creates the Harbor repository.
+- **Merges that do not bump the version publish nothing** (Dependabot, CI-only or docs-only changes): the job sees the tag already in Harbor and skips the image steps without logging in. A reused version number (tag `v<version>` already pointing at another commit) fails the job rather than overwriting anything.
+- **Concurrent merges** queue behind one another (`concurrency: publish-main`, `queue: max`), so no version is dropped.
 - **Credentials** are a Harbor robot account scoped to push on `safeinsights-public/fusion-tunnel-app`, stored as `HARBOR_USERNAME` / `HARBOR_PASSWORD` in the `harbor` GitHub environment (deployment branches: protected branches only, which is `main`). Nothing in the repo or in a PR-reachable job can read them.
 - **When a publish fails**, the run's step summary says which parts landed (image, `:latest`, release); re-running the job finishes whatever is missing without repeating what already landed.
+
+### Reusing this in another app
+
+Files to copy as they are: `.github/workflows/checks.yml`, `.github/dependabot.yml`, `.github/semgrep/` (both files), `.semgrepignore`, `trivy.yaml`, `.trivyignore.yaml` (empty its `vulnerabilities:` list; the entries here are this repo's).
+
+Then edit, in `checks.yml`:
+
+1. **`IMAGE`** in the `publish` job's `env:`, and the repository name in the Harbor API URL inside _Check whether Harbor already has this version_ (`.../repositories/<name>/artifacts/`). The project stays `safeinsights-public`; it must be a public Harbor project because the existence probe is anonymous.
+2. **The `checks` job's app steps**: the `docker build -t <name>:ci` tag, and the read-only smoke test (port, health path, required env). If the app needs a writable filesystem, say so there and drop `--read-only`; do not silently remove the test.
+3. **`compose-smoke`**: delete it, or point it at the repo's own compose stacks, and remove it from the `publish` job's `needs:`.
+4. **Semgrep packs**: swap `p/typescript` / `p/nodejs` for the app's language packs; keep `p/ci`, `p/dockerfile`, `p/github-actions`.
+5. **The advisory's path regex** (`relevant=` in `version-bump-advisory`) if the runtime source lives somewhere other than `src/` or the build config differs.
+6. **`--target runtime`** in both `docker build` calls if the Dockerfile names its final stage differently.
+
+The repo itself needs: `package.json` scripts `lint`, `typecheck`, `test`, `build`; a `version` of the form `MAJOR.MINOR.PATCH` (anything else fails `publish` on purpose); `packageManager: pnpm@…`; a Node major matching `node-version:` in the workflow (22, the runtime image's).
+
+GitHub settings (repo admin):
+
+- **`main` protected**: require a PR, require the `Lint, typecheck, test, build`, `Trivy`, `Semgrep SAST` and `compose-smoke` checks. `publish` is skipped on PRs, which branch protection counts as passing.
+- **Environment `harbor`** with _Deployment branches: protected branches only_ and the two secrets `HARBOR_USERNAME` / `HARBOR_PASSWORD`. Create the environment **before** the first merge; a job that references a missing environment auto-creates it with no branch policy. If an org-level secret of the same name is shared with the repo, unshare it: org secrets are readable by every job regardless of environment, and the environment protection is then moot.
+- **Harbor**: a robot account per repo (Projects → safeinsights-public → Robot Accounts; push + pull on repository, with an expiry), not a shared one, so a leak from one repo cannot reach the others' images.
+
+Things that bit here, so you do not rediscover them: Trivy finds new advisories between a PR going green and its merge, so a red Trivy on main with no code change is normal, and the fix is a lockfile bump (`pnpm update <pkg>@<fixed> --depth Infinity --lockfile-only`, then `pnpm dedupe --lockfile-only` if two versions remain) or a time-boxed entry in `.trivyignore.yaml` when no fixed release exists. `gh api` prints a 404's body to stdout, so test its exit status, never its output, when probing for refs.
 
 ## Lifecycle, terminal states and exit codes
 
