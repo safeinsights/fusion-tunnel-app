@@ -335,7 +335,12 @@ jobs:
                       echo "release-exists=true" >> "$GITHUB_OUTPUT"
                   else
                       echo "release-exists=false" >> "$GITHUB_OUTPUT"
-                      tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v$VERSION" --jq '.object.sha' 2>/dev/null || true)"
+                      # On 404 `gh api` prints the error body to stdout and skips --jq, so test the
+                      # exit status rather than the output: no ref means no tag.
+                      tag_sha=""
+                      if tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v$VERSION" 2>/dev/null)"; then
+                          tag_sha="$(jq -r '.object.sha' <<<"$tag_json")"
+                      fi
                       if [[ -n "$tag_sha" && "$tag_sha" != "$GITHUB_SHA" ]]; then
                           echo "::error::tag v$VERSION already points at $tag_sha, not $GITHUB_SHA. Bump the version."
                           exit 1
