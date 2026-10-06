@@ -86,7 +86,7 @@ Images are published by CI, never by hand. The image tag is `version` in `packag
 
 - **On merge to main**, once every check is green, the `publish` job builds the `runtime` target and pushes `harbor.safeinsights.org/safeinsights-public/fusion-tunnel-app:<version>`, moves `:latest` to it while main still carries that version, then creates the `v<version>` git tag and a GitHub Release with generated notes.
 - **Merges that do not bump the version publish nothing** (Dependabot, CI-only or docs-only changes): the job sees the tag already in Harbor and skips the image steps. A PR-only advisory check warns, without failing, when `src/`, the `Dockerfile`, dependencies, the lockfile or build config (`tsconfig.json`, `pnpm-workspace.yaml`, `.dockerignore`) changed and the version did not.
-- **Credentials** are a Harbor robot account scoped to push on `safeinsights-public/fusion-tunnel-app`, stored as `HARBOR_ROBOT_USERNAME` / `HARBOR_ROBOT_PASSWORD` in the `harbor` GitHub environment (deployment branches: `main` only). Nothing in the repo or in a PR-reachable job can read them.
+- **Credentials** are a Harbor robot account scoped to push on `safeinsights-public/fusion-tunnel-app`, stored as `HARBOR_USERNAME` / `HARBOR_PASSWORD` in the `harbor` GitHub environment (deployment branches: protected branches only, which is `main`). Nothing in the repo or in a PR-reachable job can read them.
 - **When a publish fails**, the run's step summary says which parts landed (image, `:latest`, release); re-running the job finishes whatever is missing without repeating what already landed.
 
 ## Lifecycle, terminal states and exit codes

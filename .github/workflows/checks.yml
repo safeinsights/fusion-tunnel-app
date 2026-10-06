@@ -375,14 +375,14 @@ jobs:
             - name: Log in to Harbor
               if: steps.harbor.outputs.image-exists == 'false' || steps.latest.outputs.move == 'true'
               env:
-                  HARBOR_ROBOT_USERNAME: ${{ secrets.HARBOR_ROBOT_USERNAME }}
-                  HARBOR_ROBOT_PASSWORD: ${{ secrets.HARBOR_ROBOT_PASSWORD }}
+                  HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+                  HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
               run: |
-                  if [[ -z "$HARBOR_ROBOT_USERNAME" || -z "$HARBOR_ROBOT_PASSWORD" ]]; then
-                      echo "::error::HARBOR_ROBOT_USERNAME / HARBOR_ROBOT_PASSWORD are not set in the 'harbor' environment (see README, Releasing)."
+                  if [[ -z "$HARBOR_USERNAME" || -z "$HARBOR_PASSWORD" ]]; then
+                      echo "::error::HARBOR_USERNAME / HARBOR_PASSWORD are not set in the 'harbor' environment (see README, Releasing)."
                       exit 1
                   fi
-                  echo "$HARBOR_ROBOT_PASSWORD" | docker login "$HARBOR_HOST" --username "$HARBOR_ROBOT_USERNAME" --password-stdin
+                  echo "$HARBOR_PASSWORD" | docker login "$HARBOR_HOST" --username "$HARBOR_USERNAME" --password-stdin
             - name: Push image
               id: push
               if: steps.harbor.outputs.image-exists == 'false' || steps.latest.outputs.move == 'true'
