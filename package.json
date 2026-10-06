@@ -22,6 +22,7 @@
         "harness:relay": "tsx testing/bin/fake-relay.ts",
         "harness:bma": "tsx testing/bin/fake-bma.ts",
         "harness:setup": "tsx testing/bin/setup.ts",
+        "harness:setup-org": "tsx testing/bin/setup-org.ts",
         "harness:rc": "tsx testing/bin/rc.ts",
         "compose:two-party": "docker compose --profile two-party run --build --rm rc-dst",
         "compose:hub": "docker compose --env-file compose.hub.env --profile hub run --build --rm rc-dst-hub",
