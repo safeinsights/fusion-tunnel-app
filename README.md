@@ -50,6 +50,8 @@ pnpm run compose:hub         # two legs (dp-a, dp-b) into one destination enclav
 
 Every tunnel container runs `read_only` with no volumes; CI also starts the runtime image with `docker run --read-only` and checks `/health`.
 
+One enclave at a time, for tunnels that run somewhere else (the in-enclave tests in `fusion-testing`): `testing/bin/setup-org.ts` (`pnpm run harness:setup-org`) is the per-org half of `setup.ts`. It provisions one tunnel for one org, leg and role against a fake BMA, holding only its own org's private key (`ORG_PRIVATE_KEY_PEM`) and taking the peer org's public key as the pinned value (`PEER_ORG_PUBLIC_KEY_PEM`); `TUNNEL_URL` or `TUNNEL_URLS` + `TUNNEL_LABEL`, `FUSION_PROVISION_TOKEN`, `BMA_URL`, `ORG_SLUG`, `PEER_ORG_SLUG`, `STUDY_ID`, `JOB_ID`, `LEG_ID`, `ROLE`, `LOCAL_API_TOKEN`, optional `CAPS_JSON`, `GUARDS_JSON`, `OPERATIONS_JSON`, `REGISTER_ORG`, `CHECK_LOCKED`, `WAIT_FOR_CHANNEL_UP_MS`. Exit 3 means the tunnel already holds another study. The fake BMA (`testing/bin/fake-bma.ts`) takes its relay-token signing key as `BMA_RELAY_PRIVATE_KEY_PEM` (the PEM itself, for a secret injected into the environment) or `BMA_RELAY_PRIVATE_KEY_FILE`; a value that is not a key is an error, never a generated fallback.
+
 ### Environment
 
 | Variable                                          | Meaning                                                                                                               | Default     |

@@ -5,23 +5,38 @@ import type { BmaKeypair } from '@/testing/relay-tokens'
 import { env } from './env'
 
 // Compose entrypoint: the in-repo fake BMA. Org keys are registered at runtime by the fake Setup
-// App. With BMA_RELAY_PRIVATE_KEY_FILE the relay-token signing key is injected instead of generated,
-// so tokens verify against the public key a real relay was deployed with. Every event is one JSON
+// App. With BMA_RELAY_PRIVATE_KEY_PEM (the key itself, as a secret injected into the environment)
+// or BMA_RELAY_PRIVATE_KEY_FILE (a mounted file) the relay-token signing key is injected instead of
+// generated, so tokens verify against the public key a real relay was deployed with; a value that
+// is not a key is an error, never a silent fallback to a generated one. Every event is one JSON
 // line so a run can be audited from the container log; nothing logged here can carry payload content.
 
-const loadKey = (path: string): BmaKeypair => {
-    const privateKey = createPrivateKey(readFileSync(path, 'utf8'))
+const loadKey = (pem: string, source: string): BmaKeypair => {
+    let privateKey
+    try {
+        privateKey = createPrivateKey(pem)
+    } catch (error) {
+        throw new Error(`${source} does not hold a private key`, { cause: error })
+    }
     const publicKey = createPublicKey(privateKey)
     return { privateKey, publicKey, publicPem: publicKey.export({ type: 'spki', format: 'pem' }) as string }
+}
+
+const injectedKey = (): BmaKeypair | undefined => {
+    const pem = process.env.BMA_RELAY_PRIVATE_KEY_PEM
+    if (pem) return loadKey(pem, 'BMA_RELAY_PRIVATE_KEY_PEM')
+    const file = process.env.BMA_RELAY_PRIVATE_KEY_FILE
+    if (file) return loadKey(readFileSync(file, 'utf8'), file)
+    return undefined
 }
 
 const line = (event: string, fields: Record<string, unknown> = {}) =>
     console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...fields }))
 
 const main = async () => {
-    const keyFile = process.env.BMA_RELAY_PRIVATE_KEY_FILE
+    const key = injectedKey()
     const bma = new FakeBma({
-        ...(keyFile ? { key: loadKey(keyFile) } : {}),
+        ...(key ? { key } : {}),
         relayEndpoint: env('RELAY_WS_URL'),
         relayTokenTtlS: Number(env('RELAY_TOKEN_TTL_S', '900')),
         host: env('HOST', '127.0.0.1'),
