@@ -2,7 +2,7 @@
 
 The SafeInsights **Fusion Tunnel App**: a per-study-job, per-leg enclave container for the Enclave Fusion Framework. It owns all inter-enclave communication and end-to-end encryption (Noise_IK). Researcher code talks only to its enclave-local API through the fusion SDK; the tunnel talks only to the Fusion Relay and the Management App (BMA). It is launched, provisioned and torn down by the Setup App and holds no long-lived secrets: every keypair is minted in memory at launch and dies with the container.
 
-**Status: branch `simplify` (2026-09-24).** Local API v2 (`apiVersion 2.0.0`) and relay wire protocol v2, against a memory-only pass-through relay (`fusion-relay`, branch `simplify`). The in-process harness runs two-party and hub studies against in-repo fakes of the relay and the BMA. Not yet exercised against a real BMA.
+**Status (2026-10-27): 0.0.1 on `main`.** Local API v2 (`apiVersion 2.0.0`) and relay wire protocol v2, against the memory-only pass-through relay (`fusion-relay` `main`, deployed in Sandbox and Dev). CI publishes the image to Harbor and it runs as a service in the Mars U Fusion enclaves (Sandbox, Dev) against the deployed sandbox relay; the in-process harness runs two-party and hub studies against in-repo fakes of the relay and the BMA. Exercised only against the in-repo fake BMA: the Management App has no `/tunnel/*` routes yet.
 
 - Authoritative spec: `SafeInsights Enclave Fusion Architecture Doc-v2.md` (§4.1, §5–§8, §13) in the parent workspace; design changes are recorded in `fusion-program/products/fusion/DECISIONS.md`
 - Local API contract for SDK authors: `fusion-sdk/spec/local-api.md`
@@ -54,33 +54,33 @@ One enclave at a time, for tunnels that run somewhere else (the in-enclave tests
 
 ### Environment
 
-| Variable                                          | Meaning                                                                                                               | Default     |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ----------- |
-| `PORT`                                            | enclave-local listen port                                                                                             | 3003        |
-| `FUSION_PROVISION_TOKEN`                          | **required** bootstrap bearer for `/local/*`; the Setup App injects it into the tunnel container only, never the RC's | —           |
-| `FUSION_LONGPOLL_MS`                              | long-poll hold                                                                                                        | 25000       |
-| `FUSION_HEARTBEAT_MS` / `FUSION_HEARTBEAT_MISSES` | relay heartbeat watchdog (ADMITTED cadence overrides)                                                                 | 30000 / 2   |
-| `FUSION_RECONNECT_MIN_MS` / `_MAX_MS`             | relay re-dial backoff                                                                                                 | 500 / 30000 |
-| `FUSION_TOKEN_REFRESH_LEAD_MS`                    | pre-fetch relay token / refresh credential this long before `exp`                                                     | 120000      |
-| `FUSION_STATUS_INTERVAL_MS`                       | BMA status report cadence (also on transitions, near a cap, and terminally)                                           | 60000       |
-| `FUSION_PEERKEY_POLL_MS`                          | directory poll while the peer has not published                                                                       | 5000        |
-| `FUSION_CLOSE_TIMEOUT_MS`                         | bound on the CLOSE sequence                                                                                           | 30000       |
-| `FUSION_HANDSHAKE_RETRY_MS` / `_MAX_ATTEMPTS`     | message-1 retry cadence / bound                                                                                       | 2000 / 300  |
-| `FUSION_RETRANSMIT_MS`                            | re-send an un-ACKed message after this long                                                                           | 5000        |
-| `FUSION_MAX_SENDS`                                | sends of one message before the leg is `ERRORED`                                                                      | 10          |
-| `FUSION_UNACKED_MAX_MS`                           | age of the oldest un-ACKed message before the leg is `ERRORED`                                                        | 24 h        |
-| `FUSION_BACKPRESSURE_RETRY_MS`                    | re-offer after relay BACKPRESSURE / RATE_LIMITED                                                                      | 500         |
-| `FUSION_INFLIGHT_MAX_MSGS`                        | un-ACKed messages the outbox holds before `POST` answers 429                                                          | 64          |
-| `FUSION_OUTBOX_MAX_BYTES`                         | plaintext bytes the outbox holds before `POST` answers 429                                                            | 256 MiB     |
-| `FUSION_MAX_MESSAGE_BYTES`                        | largest message payload accepted on the local API (413 above)                                                         | 64 MiB      |
-| `FUSION_INBOX_MAX_BYTES`                          | bound on partially reassembled inbound bytes                                                                          | 64 MiB      |
-| `FUSION_EXIT_GRACE_MS`                            | keep the local API up after a terminal state                                                                          | 5000        |
+| Variable                                          | Meaning                                                                                                                                            | Default     |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `PORT`                                            | enclave-local listen port                                                                                                                          | 3003        |
+| `FUSION_PROVISION_TOKEN`                          | **required** bootstrap bearer for `/local/*`; the Setup App injects it into the tunnel container only, never the RC's                              | —           |
+| `FUSION_LONGPOLL_MS`                              | long-poll hold                                                                                                                                     | 25000       |
+| `FUSION_HEARTBEAT_MS` / `FUSION_HEARTBEAT_MISSES` | relay heartbeat watchdog (ADMITTED cadence overrides)                                                                                              | 30000 / 2   |
+| `FUSION_RECONNECT_MIN_MS` / `_MAX_MS`             | relay re-dial backoff                                                                                                                              | 500 / 30000 |
+| `FUSION_TOKEN_REFRESH_LEAD_MS`                    | pre-fetch relay token / refresh credential this long before `exp`                                                                                  | 120000      |
+| `FUSION_STATUS_INTERVAL_MS`                       | BMA status report cadence (also on transitions, near a cap, and terminally)                                                                        | 60000       |
+| `FUSION_PEERKEY_POLL_MS`                          | directory poll cadence from configure until CHANNEL_UP (restarted when the peer re-publishes); also the retry cadence for token/credential refresh | 5000        |
+| `FUSION_CLOSE_TIMEOUT_MS`                         | bound on the CLOSE sequence                                                                                                                        | 30000       |
+| `FUSION_HANDSHAKE_RETRY_MS` / `_MAX_ATTEMPTS`     | message-1 retry cadence / bound                                                                                                                    | 2000 / 300  |
+| `FUSION_RETRANSMIT_MS`                            | re-send an un-ACKed message after this long                                                                                                        | 5000        |
+| `FUSION_MAX_SENDS`                                | sends of one message before the leg is `ERRORED`                                                                                                   | 10          |
+| `FUSION_UNACKED_MAX_MS`                           | age of the oldest un-ACKed message before the leg is `ERRORED`                                                                                     | 24 h        |
+| `FUSION_BACKPRESSURE_RETRY_MS`                    | re-offer after relay BACKPRESSURE / RATE_LIMITED                                                                                                   | 500         |
+| `FUSION_INFLIGHT_MAX_MSGS`                        | un-ACKed messages the outbox holds before `POST` answers 429                                                                                       | 64          |
+| `FUSION_OUTBOX_MAX_BYTES`                         | plaintext bytes the outbox holds before `POST` answers 429                                                                                         | 256 MiB     |
+| `FUSION_MAX_MESSAGE_BYTES`                        | largest message payload accepted on the local API (413 above)                                                                                      | 64 MiB      |
+| `FUSION_INBOX_MAX_BYTES`                          | bound on partially reassembled inbound bytes                                                                                                       | 64 MiB      |
+| `FUSION_EXIT_GRACE_MS`                            | keep the local API up after a terminal state                                                                                                       | 5000        |
 
 All tuning values are **provisional** (v2 §15.6) pending load testing against the real relay. Padding buckets are a frozen wire constant (`PAD_BUCKETS` in `src/schemas/channel.ts`), not tuning.
 
 ### RC-facing env contract (what the Setup App injects)
 
-`FUSION_ROLE` (`source|destination`); one leg: `FUSION_TUNNEL_ENDPOINT` + `FUSION_TUNNEL_TOKEN`; N legs at the hub: `FUSION_TUNNEL_ENDPOINTS` + `FUSION_TUNNEL_TOKENS` JSON maps keyed by leg label. `GET /v1/info` returns `{legId, peerOrgSlug, role, direction, state, caps, guards?, operations?, apiVersion}` so a peer-addressed SDK maps each endpoint to a peer.
+`FUSION_ROLE` (`source|destination`); one leg: `FUSION_TUNNEL_ENDPOINT` + `FUSION_TUNNEL_TOKEN`; N legs at the hub: `FUSION_TUNNEL_ENDPOINTS` + `FUSION_TUNNEL_TOKENS` JSON maps keyed by leg label. `GET /v1/info` returns `{apiVersion, studyId, jobId, legId, orgSlug, peerOrgSlug, role, direction, state, caps, guards?, operations?}` so a peer-addressed SDK maps each endpoint to a peer.
 
 ## CI/CD
 

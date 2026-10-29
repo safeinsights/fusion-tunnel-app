@@ -22,7 +22,7 @@ export const TUNING_DEFAULTS = Object.freeze({
     tokenRefreshLeadMs: 120_000,
     /** Content-free status report cadence to the BMA (§12). */
     statusIntervalMs: 60_000,
-    /** Peer-key directory poll interval while the peer has not published (204). */
+    /** Peer-key directory poll interval from configure until CHANNEL_UP (204 until the peer publishes); restarted when the peer re-publishes, and reused as the retry cadence for token/credential refresh. */
     peerKeyPollMs: 5_000,
     /** Bound on the CLOSE sequence before the tunnel gives up waiting for acks (§7.6). */
     closeTimeoutMs: 30_000,
