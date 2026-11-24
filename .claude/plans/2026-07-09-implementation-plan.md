@@ -1,4 +1,4 @@
-> **Superseded 2026-09-24 (branch `simplify`).** The blob path, the ack route, the relay-side mailbox/epoch/dead-letter machinery this plan assumes and the `src/routes`, `src/http`, `src/lib/relay` layouts no longer exist. Current design: `README.md` here and `fusion-program/products/fusion/DECISIONS.md` (2026-09-24 entry). Kept for history only.
+> **Superseded 2026-09-24 (branch `simplify`).** The blob path, the ack route, the relay-side mailbox/epoch/dead-letter machinery this plan assumes and the `src/routes`, `src/http`, `src/lib/relay` layouts no longer exist. Current design: `README.md` here and `fusion-decisions.md` (2026-09-24 entry). Kept for history only.
 
 # Fusion Tunnel App — Implementation Plan
 
