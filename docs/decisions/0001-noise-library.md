@@ -60,7 +60,7 @@ handled one layer up by the AEAD-protected `messageId`. Only authenticated frame
 window. Retransmissions from the sender's outbox are fresh frames (new counter, same
 AEAD-protected `messageId`), so a replayed ciphertext can never be mistaken for one.
 
-_2026-09-24: rewritten when the relay became memory-only (fusion-program DECISIONS.md, same
+_2026-09-24: rewritten when the relay became memory-only (`fusion-decisions.md` in the parent workspace, same
 date). The earlier text justified the counter by the relay's byte-identical redelivery of
 un-ACKed items; that redelivery no longer exists._
 

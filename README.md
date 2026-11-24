@@ -4,7 +4,7 @@ The SafeInsights **Fusion Tunnel App**: a per-study-job, per-leg enclave contain
 
 **Status: branch `simplify` (2026-09-24).** Local API v2 (`apiVersion 2.0.0`) and relay wire protocol v2, against a memory-only pass-through relay (`fusion-relay`, branch `simplify`). The in-process harness runs two-party and hub studies against in-repo fakes of the relay and the BMA. Not yet exercised against a real BMA.
 
-- Authoritative spec: `SafeInsights Enclave Fusion Architecture Doc-v2.md` (§4.1, §5–§8, §13) in the parent workspace; design changes are recorded in `fusion-program/products/fusion/DECISIONS.md`
+- Authoritative spec: `SafeInsights Enclave Fusion Architecture Doc-v2.md` (§4.1, §5–§8, §13) in the parent workspace; design changes are recorded in `fusion-decisions.md`
 - Local API contract for SDK authors: `fusion-sdk/spec/local-api.md`
 - Decisions: [`docs/decisions/`](docs/decisions/) — 0001 Noise library and explicit transport counters, 0002 one tunnel per leg
 
