@@ -173,6 +173,10 @@ jobs:
             # release-age rule wants a 7-day cooldown, but the org standard is 2 days
             # (minimumReleaseAge: 2880 in every pnpm repo, management-app included), so that
             # rule is excluded here rather than the setting changed.
+            # The uv cooldown rule fires on the [tool.uv] override table in
+            # .github/semgrep/pyproject.toml and also wants 7 days; a cooldown there would hold
+            # back the very Semgrep releases that lift the overridden pins, so it is excluded
+            # too (fusion-sdk does the same).
             - name: Semgrep
               run: >-
                   uv run --locked --project .github/semgrep semgrep scan
@@ -182,6 +186,7 @@ jobs:
                   --config p/dockerfile
                   --config p/github-actions
                   --exclude-rule package_managers.pnpm.pnpm-missing-minimum-release-age.pnpm-minimum-release-age
+                  --exclude-rule package_managers.uv.uv-missing-dependency-cooldown.uv-missing-dependency-cooldown
                   --metrics=off --error --text .
 
     # Advisory only: on a PR that touches runtime-relevant paths without bumping package.json

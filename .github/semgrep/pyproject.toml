@@ -1,12 +1,30 @@
 # Semgrep for the `semgrep` job in .github/workflows/checks.yml. uv.lock next to this file pins
 # Semgrep and every transitive dependency with hashes, the uv equivalent of a SHA-pinned action,
 # and the job installs it with `uv sync --locked`. To bump Semgrep: change the version below,
-# run `uv lock --project .github/semgrep` from the repo root, commit both files. Dependabot does
-# not manage this lock: Semgrep pins its own dependencies tightly, so single-package bumps
-# cannot resolve. There is deliberately no uv-specific config table and no build system: the
-# project is virtual (nothing of ours is built or installed).
+# run `uv lock --upgrade --project .github/semgrep` from the repo root, commit both files.
+# Dependabot does not manage this lock: Semgrep pins its own dependencies tightly, so
+# single-package bumps cannot resolve. There is no build system: the project is virtual
+# (nothing of ours is built or installed).
 [project]
 name = "semgrep-ci"
 version = "0"
 requires-python = ">=3.12"
-dependencies = ["semgrep==1.182.1"]
+dependencies = ["semgrep==1.186.0"]
+
+# Semgrep (through 1.186.0) pins these below their fixed versions, so the lock can only take
+# the fixes by overriding the pins. Same set as management-app's
+# services/semgrep-runner/requirements-overrides.txt. Remove each entry once a Semgrep release
+# moves its pin, then re-lock.
+[tool.uv]
+override-dependencies = [
+    # mcp: CVE-2026-115563, CVE-2026-59951, CVE-2026-116684, CVE-2026-116685, CVE-2026-116686
+    "mcp==1.30.0",
+    # opentelemetry-api: CVE-2026-114603, CVE-2026-126360. The OpenTelemetry packages move together.
+    "opentelemetry-api==1.45.2",
+    "opentelemetry-sdk==1.45.2",
+    "opentelemetry-exporter-otlp-proto-http==1.45.2",
+    "opentelemetry-instrumentation-requests==0.66b2",
+    "opentelemetry-instrumentation-threading==0.66b2",
+    # wcmatch: CVE-2026-132276
+    "wcmatch==11.2",
+]
